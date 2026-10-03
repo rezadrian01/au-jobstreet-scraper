@@ -1,0 +1,29 @@
+# Konfigurasi scraper Seek. Semua nilai di sini diverifikasi dari request nyata (3 Okt 2026).
+
+# Nilai `where` yang dipakai Seek. "All <kota>" = seluruh wilayah kota;
+# "Sydney NSW" saja ditafsirkan sebagai suburb Sydney 2000 + radius 50 km.
+locations = ["All Sydney NSW", "All Melbourne VIC"]
+
+[search]
+site_key = "AU-Main"
+locale = "en-AU"
+classification = 1200      # Accounting
+daterange = 7              # N hari terakhir; 0 = tanpa filter tanggal (override: --daterange)
+sort_mode = "ListedDate"
+page_size = 100
+max_pages = 20             # batas pengaman; peringatan muncul jika tercapai
+
+[subclassifications]
+"Audit - External" = 6144
+"Audit - Internal" = 6145
+
+[http]
+user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+timeout = 30
+delay_min = 2.0            # jeda antar request (detik), dengan jitter acak
+delay_max = 5.0
+max_retries = 4            # retry saat 403/429/5xx/error jaringan
+backoff_base = 5.0         # detik; dikali 2 tiap retry
+
+[storage]
+db_path = "data/seek_jobs.db"
