@@ -1,9 +1,11 @@
-# Seek Audit Job Scraper
+# Job Scraper: Seek Australia & JobStreet Indonesia
 
-Mengambil lowongan **Accounting > Audit - External / Audit - Internal** di **Sydney** dan **Melbourne**
-dari au.seek.com, menyimpannya ke SQLite, dengan opsi export CSV.
+Mengambil lowongan **Accounting** dari **au.seek.com** dan **id.jobstreet.com** lewat UI web lokal, dengan
+kriteria yang bisa diganti-ganti: situs, lokasi, subklasifikasi, rentang hari, dan filter software.
 
-Sumber data adalah JSON API yang dipakai frontend Seek (`/api/jobsearch/v5/search`), bukan parsing HTML.
+Sumber data adalah JSON API yang dipakai frontend kedua situs (pencarian lewat `/api/jobsearch/v5/search`,
+deskripsi lewat `/graphql`), bukan parsing HTML. Tidak ada database: setiap tarikan mengambil data terbaru
+dari situs.
 
 ## Install
 
@@ -14,65 +16,70 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-## Menjalankan
+## Menjalankan UI
 
 ```bash
-# 7 hari terakhir (default dari config.toml), simpan ke data/seek_jobs.db
-.venv/bin/python scraper.py
-
-# 14 hari terakhir + export hasil run ini ke CSV
-.venv/bin/python scraper.py --daterange 14 --csv data/jobs.csv
-
-# Semua lowongan yang masih aktif (tanpa filter tanggal)
-.venv/bin/python scraper.py --daterange 0 --csv data/jobs.csv
+.venv/bin/streamlit run app.py
 ```
 
-| Opsi | Arti |
+Browser akan terbuka di `http://localhost:8501`.
+
+1. Di panel kiri, atur semua kriteria: **sumber data**, **lokasi**, **subklasifikasi**, **rentang hari**,
+   dan **software**.
+   - Lokasi dikosongkan = semua lokasi. Lokasi lain bisa diketik langsung.
+   - Default Australia: Sydney, Melbourne, Brisbane. Default Indonesia: semua kota.
+   - Subklasifikasi dikosongkan = semua subklasifikasi Accounting.
+   - Software opsional (mis. `Xero, MYOB`). Jika diisi, hanya lowongan yang menyebut salah satunya yang
+     ditampilkan, dan kolom **Software** menunjukkan mana yang cocok. Bisa diubah kapan saja tanpa menarik ulang.
+2. Klik **Tarik data**.
+3. **Download CSV** atau **Download Excel** berisi baris yang sedang ditampilkan.
+
+## Data yang diambil
+
+| Kolom | Isi |
 |---|---|
-| `--daterange N` | Lowongan yang diposting N hari terakhir. `0` = tanpa filter. |
-| `--csv FILE` | Export job dari run ini ke CSV. |
-| `--csv-all` | Bersama `--csv`: export seluruh isi database, bukan hanya run ini. |
-| `--config FILE` | Pakai file config lain. |
-| `-v` | Log detail tiap request. |
-
-Satu perintah menjalankan 4 kombinasi (2 lokasi x 2 subklasifikasi). Exit code `1` jika ada kombinasi yang gagal.
-
-## Konfigurasi
-
-Semua di `config.toml`: lokasi, ID subklasifikasi, date range default, ukuran halaman, jeda antar request, retry.
-
-- Lokasi memakai nilai `where` Seek. `All Sydney NSW` = seluruh wilayah Sydney; `Sydney NSW` saja berarti
-  suburb Sydney 2000 + radius 50 km.
-- ID: Accounting = `1200`, Audit - External = `6144`, Audit - Internal = `6145`.
-
-## Output
-
-Tabel `jobs` (primary key `job_id`, di-upsert sehingga run berulang tidak membuat duplikat):
-
-`job_id`, `title`, `company`, `location`, `search_location`, `work_arrangement`, `subclassification`,
-`work_type`, `salary`, `listed_at` (ISO 8601 UTC), `job_url`, `scraped_at` (ISO 8601 UTC).
-
-`salary` dan `work_arrangement` kosong jika pengiklan tidak mencantumkannya.
+| `title` | Judul lowongan |
+| `description` | Isi lengkap lowongan (deskripsi dan requirement), teks polos |
+| `subclassification` | Mis. Audit - External |
+| `company` | Nama perusahaan / pengiklan |
+| `location` | Lokasi versi situs, mis. "Macquarie Park, Sydney NSW" |
+| `salary` | Kosong jika pengiklan tidak mencantumkan |
+| `listed_at` | Tanggal posting. Di UI dan hasil download: waktu lokal situs; di CLI: ISO 8601 UTC |
+| `software` | Software dari filter yang disebut di judul atau deskripsi |
+| `work_type`, `work_arrangement` | Full time / contract, on-site / hybrid / remote |
+| `job_id`, `search_location`, `job_url`, `scraped_at` | Pelengkap |
 
 ## Hal yang perlu diketahui
 
-- **Database terakumulasi.** Job yang sudah hilang dari Seek tetap ada di database. `--csv` tanpa `--csv-all`
-  hanya berisi job yang terlihat di run tersebut (snapshot terbaru). Untuk snapshot bersih, hapus
-  `data/seek_jobs.db` sebelum menjalankan.
-- **Lowongan hanya hidup sekitar 30 hari** di Seek, jadi `--daterange` di atas ~31 tidak menambah hasil.
-- **Duplikat promoted.** Seek menyisipkan salinan "promoted" dari job yang sama; scraper membuangnya dan
-  mencatat jumlahnya di log.
+- **Tidak bisa backdate.** Kedua situs hanya menampilkan lowongan aktif, sekitar 30 hari ke belakang.
+  Karena tidak ada database, lowongan yang sudah hilang dari situs tidak bisa diambil lagi.
+- **Deskripsi butuh 1 request per lowongan** dengan jeda 1,5-3 detik. Kira-kira 2,5 menit per 60 lowongan.
+  Kriteria yang lebar (mis. semua Accounting di Jakarta, hampir 2.000 lowongan) bisa lebih dari satu jam.
+  Hilangkan centang **Ambil deskripsi lowongan** untuk melihat jumlahnya dulu, lalu ambil deskripsinya dengan
+  tombol yang muncul di halaman hasil.
+- **Filter software mencocokkan teks**, tanpa peduli huruf besar/kecil dan per kata utuh ("SAP" tidak cocok
+  dengan "sapling"). Software yang tidak disebut namanya tidak akan ketemu, dan nama yang juga kata umum
+  (mis. "Accurate", "Sage") bisa cocok dengan kata biasa.
+- **Duplikat dibuang.** Situs menyisipkan salinan "promoted" dari job yang sama; job yang muncul di lebih
+  dari satu lokasi juga hanya diambil sekali.
 - **Peringatan data terpotong** muncul jika `max_pages` tercapai sebelum semua hasil terambil.
-- **Sopan terhadap server:** jeda acak 2-5 detik antar request, tanpa request paralel, retry dengan backoff
-  saat 403/429/5xx. Terms of Service Seek melarang akses otomatis; jaga skala tetap kecil.
+- **Sopan terhadap server:** jeda acak antar request, tanpa request paralel, retry dengan backoff saat
+  403/429/5xx. Terms of Service Seek melarang akses otomatis; jaga skala tetap kecil dan jalankan lokal saja.
 
-## Menjadwalkan (jika butuh data historis)
+## Konfigurasi
 
-Contoh cron harian pukul 07:00, mengakumulasi ke database yang sama:
+Semua di `config.toml`: daftar situs dan lokasi, ID subklasifikasi, pilihan default, jeda antar request, retry.
 
-```cron
-0 7 * * * cd "/path/ke/project" && .venv/bin/python scraper.py --daterange 3 >> data/scrape.log 2>&1
+## CLI (opsional)
+
+Logika yang sama tanpa UI, menulis CSV:
+
+```bash
+.venv/bin/python scraper.py --site seek_au --daterange 7 --software "Xero, MYOB" --csv data/jobs.csv
+.venv/bin/python scraper.py --site jobstreet_id --location "Jakarta Raya" --subclass "Taxation" --no-description
 ```
+
+`--subclass all` = semua subklasifikasi Accounting. Lihat `--help` untuk semua opsi.
 
 ## Test
 

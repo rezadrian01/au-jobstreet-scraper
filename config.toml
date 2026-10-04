@@ -1,29 +1,88 @@
-# Konfigurasi scraper Seek. Semua nilai di sini diverifikasi dari request nyata (3 Okt 2026).
-
-# Nilai `where` yang dipakai Seek. "All <kota>" = seluruh wilayah kota;
-# "Sydney NSW" saja ditafsirkan sebagai suburb Sydney 2000 + radius 50 km.
-locations = ["All Sydney NSW", "All Melbourne VIC"]
+# Konfigurasi scraper. Semua nilai diverifikasi dari request nyata (Oktober 2026).
 
 [search]
-site_key = "AU-Main"
-locale = "en-AU"
 classification = 1200      # Accounting
-daterange = 7              # N hari terakhir; 0 = tanpa filter tanggal (override: --daterange)
+classification_name = "Accounting"
 sort_mode = "ListedDate"
 page_size = 100
-max_pages = 20             # batas pengaman; peringatan muncul jika tercapai
-
-[subclassifications]
-"Audit - External" = 6144
-"Audit - Internal" = 6145
+max_pages = 50             # batas pengaman; peringatan muncul jika tercapai
+default_daterange = 7      # N hari terakhir; 0 = tanpa filter tanggal
 
 [http]
 user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 timeout = 30
-delay_min = 2.0            # jeda antar request (detik), dengan jitter acak
+delay_min = 2.0            # jeda antar request pencarian (detik), dengan jitter acak
 delay_max = 5.0
+detail_delay_min = 1.5     # jeda antar request deskripsi (1 request per lowongan)
+detail_delay_max = 3.0
 max_retries = 4            # retry saat 403/429/5xx/error jaringan
 backoff_base = 5.0         # detik; dikali 2 tiap retry
 
-[storage]
-db_path = "data/seek_jobs.db"
+# Lokasi memakai nilai `where` situs. Di Seek, "All <kota>" = seluruh wilayah kota;
+# "Sydney NSW" saja ditafsirkan sebagai suburb Sydney 2000 + radius 50 km.
+[sites.seek_au]
+name = "Seek Australia (au.seek.com)"
+base_url = "https://au.seek.com"
+site_key = "AU-Main"
+locale = "en-AU"
+timezone = "Australia/Sydney"
+locations = [
+    "All Sydney NSW",
+    "All Melbourne VIC",
+    "All Brisbane QLD",
+    "All Perth WA",
+    "All Adelaide SA",
+    "All Canberra ACT",
+    "All Australia",
+]
+default_locations = ["All Sydney NSW", "All Melbourne VIC", "All Brisbane QLD"]
+all_locations_label = "Semua lokasi di Australia"
+
+[sites.jobstreet_id]
+name = "JobStreet Indonesia (id.jobstreet.com)"
+base_url = "https://id.jobstreet.com"
+site_key = "ID-Main"
+locale = "en-ID"
+timezone = "Asia/Jakarta"
+locations = [
+    "Jakarta Raya",
+    "Jawa Barat",
+    "Jawa Timur",
+    "Banten",
+    "Bali",
+    "Surabaya",
+    "Bandung",
+]
+default_locations = []     # kosong = semua kota di Indonesia
+all_locations_label = "Semua kota di Indonesia"
+
+# Subklasifikasi di bawah Accounting. ID sama di kedua situs.
+[subclassifications]
+"Accounts Officers/Clerks" = 6140
+"Accounts Payable" = 1303
+"Accounts Receivable/Credit Control" = 6141
+"Analysis & Reporting" = 6143
+"Assistant Accountants" = 6142
+"Audit - External" = 6144
+"Audit - Internal" = 6145
+"Bookkeeping & Small Practice Accounting" = 6146
+"Business Services & Corporate Advisory" = 6147
+"Company Secretaries" = 6148
+"Compliance & Risk" = 6149
+"Cost Accounting" = 6150
+"Financial Accounting & Reporting" = 6151
+"Financial Managers & Controllers" = 6152
+"Forensic Accounting & Investigation" = 6153
+"Insolvency & Corporate Recovery" = 6154
+"Inventory & Fixed Assets" = 6155
+"Management" = 6156
+"Management Accounting & Budgeting" = 6157
+"Payroll" = 1468
+"Strategy & Planning" = 6158
+"Systems Accounting & IT Audit" = 6159
+"Taxation" = 6160
+"Treasury" = 6161
+"Other" = 6162
+
+[defaults]
+subclassifications = ["Audit - External", "Audit - Internal"]

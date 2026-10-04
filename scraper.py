@@ -1,4 +1,7 @@
-"""Scraper lowongan au.seek.com (Accounting > Audit) ke SQLite, dengan export CSV."""
+"""Scraper lowongan Accounting dari au.seek.com dan id.jobstreet.com.
+
+Modul ini berisi logika inti (dipakai oleh app.py) dan CLI sederhana yang menulis CSV.
+"""
 
 from __future__ import annotations
 
@@ -6,19 +9,24 @@ import argparse
 import csv
 import logging
 import random
-import sqlite3
+import re
 import sys
 import time
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
+from typing import Callable
 
 import httpx
 
-BASE_URL = "https://au.seek.com"
 SEARCH_PATH = "/api/jobsearch/v5/search"
+GRAPHQL_PATH = "/graphql"
 RETRY_STATUSES = {403, 429, 500, 502, 503, 504}
+CONFIG_PATH = Path(__file__).with_name("config.toml")
+
+JOB_DETAILS_QUERY = "query jobDetails($id: ID!) { jobDetails(id: $id) { job { id content } } }"
 
 FIELDS = [
     "job_id",
@@ -26,11 +34,13 @@ FIELDS = [
     "company",
     "location",
     "search_location",
-    "work_arrangement",
     "subclassification",
     "work_type",
+    "work_arrangement",
     "salary",
     "listed_at",
+    "software",
+    "description",
     "job_url",
     "scraped_at",
 ]
@@ -48,7 +58,15 @@ class Stats:
     failed_requests: int = 0
 
 
-def load_config(path: Path) -> dict:
+@dataclass
+class SearchResult:
+    rows: list[dict] = field(default_factory=list)
+    messages: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    failed_locations: int = 0
+
+
+def load_config(path: Path = CONFIG_PATH) -> dict:
     with path.open("rb") as f:
         return tomllib.load(f)
 
@@ -60,17 +78,77 @@ def normalize_iso(value: str | None) -> str | None:
     return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
 
 
-def parse_job(raw: dict, search_location: str, sub_names: dict[str, str], scraped_at: str) -> dict:
-    """Ubah satu item response API menjadi baris database.
+class _TextExtractor(HTMLParser):
+    BLOCK_TAGS = {"p", "br", "li", "ul", "ol", "div", "h1", "h2", "h3", "h4", "h5", "h6", "tr"}
+
+    def __init__(self):
+        super().__init__()
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+        if tag == "li":
+            self.parts.append("- ")
+
+    def handle_endtag(self, tag):
+        if tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+
+def html_to_text(content: str | None) -> str:
+    if not content:
+        return ""
+    parser = _TextExtractor()
+    parser.feed(content)
+    parser.close()
+    text = "".join(parser.parts).replace("\xa0", " ")
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
+    return "\n".join(line for line in lines if line and line != "-")
+
+
+def parse_terms(raw: str | None) -> list[str]:
+    """Pecah input "Xero, MYOB" (koma atau baris baru) menjadi daftar tanpa duplikat."""
+    terms: list[str] = []
+    for part in re.split(r"[,\n;]", raw or ""):
+        term = part.strip()
+        if term and term.lower() not in (t.lower() for t in terms):
+            terms.append(term)
+    return terms
+
+
+def match_software(text: str | None, terms: list[str]) -> list[str]:
+    """Kembalikan software yang disebut di teks: tanpa peduli huruf besar/kecil, per kata utuh."""
+    if not text:
+        return []
+    found = []
+    for term in terms:
+        pattern = r"(?<![A-Za-z0-9])" + re.escape(term) + r"(?![A-Za-z0-9])"
+        if re.search(pattern, text, re.IGNORECASE):
+            found.append(term)
+    return found
+
+
+def parse_job(raw: dict, base_url: str, search_location: str, classification: int, sub_ids: list[int], scraped_at: str) -> dict:
+    """Ubah satu item response pencarian menjadi baris hasil.
 
     Satu job bisa punya beberapa klasifikasi (mis. Audit - Internal + Government - Federal),
-    jadi subklasifikasi diambil dari entri yang ID-nya ada di config, bukan entri pertama.
+    jadi subklasifikasi diambil dari entri klasifikasi yang dicari, bukan entri pertama.
     """
-    subs = []
+    wanted = {str(s) for s in sub_ids}
+    in_class, selected = [], []
     for c in raw.get("classifications") or []:
-        sub_id = str((c.get("subclassification") or {}).get("id"))
-        if sub_id in sub_names and sub_names[sub_id] not in subs:
-            subs.append(sub_names[sub_id])
+        sub = c.get("subclassification") or {}
+        name = sub.get("description")
+        if not name or str((c.get("classification") or {}).get("id")) != str(classification):
+            continue
+        if name not in in_class:
+            in_class.append(name)
+        if str(sub.get("id")) in wanted and name not in selected:
+            selected.append(name)
     job_id = str(raw["id"])
     return {
         "job_id": job_id,
@@ -78,46 +156,51 @@ def parse_job(raw: dict, search_location: str, sub_names: dict[str, str], scrape
         "company": raw.get("companyName") or (raw.get("advertiser") or {}).get("description"),
         "location": "; ".join(loc["label"] for loc in raw.get("locations") or [] if loc.get("label")) or None,
         "search_location": search_location,
-        "work_arrangement": (raw.get("workArrangements") or {}).get("displayText") or None,
-        "subclassification": "; ".join(subs) or None,
+        "subclassification": "; ".join(selected or in_class) or None,
         "work_type": "; ".join(raw.get("workTypes") or []) or None,
+        "work_arrangement": (raw.get("workArrangements") or {}).get("displayText") or None,
         "salary": raw.get("salaryLabel") or None,
         "listed_at": normalize_iso(raw.get("listingDate")),
-        "job_url": f"{BASE_URL}/job/{job_id}",
+        "software": None,
+        "description": None,
+        "job_url": f"{base_url}/job/{job_id}",
         "scraped_at": scraped_at,
     }
 
 
 class SeekClient:
-    def __init__(self, cfg: dict, stats: Stats, sleep=time.sleep):
-        self.search = cfg["search"]
+    def __init__(self, cfg: dict, site_key: str, stats: Stats | None = None, sleep=time.sleep):
+        self.site = cfg["sites"][site_key]
+        self.search_cfg = cfg["search"]
         self.http = cfg["http"]
-        self.stats = stats
+        self.stats = stats or Stats()
         self.sleep = sleep
         self._first = True
+        base_url = self.site["base_url"]
         self.client = httpx.Client(
-            base_url=BASE_URL,
+            base_url=base_url,
             timeout=self.http["timeout"],
             headers={
                 "User-Agent": self.http["user_agent"],
                 "Accept": "application/json",
                 "Accept-Language": "en-AU,en;q=0.9",
-                "Referer": BASE_URL + "/",
+                "Origin": base_url,
+                "Referer": base_url + "/",
             },
         )
 
     def close(self) -> None:
         self.client.close()
 
-    def _get(self, params: dict) -> dict:
+    def _request(self, method: str, path: str, delay: tuple[float, float], **kwargs) -> dict:
         retries = self.http["max_retries"]
         for attempt in range(retries + 1):
             if not self._first:
-                self.sleep(random.uniform(self.http["delay_min"], self.http["delay_max"]))
+                self.sleep(random.uniform(*delay))
             self._first = False
             self.stats.requests += 1
             try:
-                resp = self.client.get(SEARCH_PATH, params=params)
+                resp = self.client.request(method, path, **kwargs)
                 if resp.status_code == 200:
                     return resp.json()
                 reason = f"HTTP {resp.status_code}"
@@ -133,30 +216,33 @@ class SeekClient:
             self.sleep(wait)
         raise FetchError("unreachable")
 
-    def fetch_combination(self, where: str, sub_id: int, daterange: int) -> tuple[list[dict], int, int, bool]:
-        """Ambil semua halaman untuk satu kombinasi lokasi x subklasifikasi.
+    def search(self, where: str, sub_ids: list[int], daterange: int) -> tuple[list[dict], int, int, bool]:
+        """Ambil semua halaman hasil pencarian untuk satu lokasi.
 
         Mengembalikan (jobs, received, total_count, truncated). `received` adalah jumlah item
-        mentah: Seek menyisipkan salinan "promoted" dari job yang sama dan ikut menghitungnya
+        mentah: situs menyisipkan salinan "promoted" dari job yang sama dan ikut menghitungnya
         di totalCount, jadi pagination dibandingkan dengan item mentah, bukan job unik.
         """
         params = {
-            "siteKey": self.search["site_key"],
-            "locale": self.search["locale"],
-            "where": where,
-            "classification": self.search["classification"],
-            "subclassification": sub_id,
-            "sortmode": self.search["sort_mode"],
-            "pageSize": self.search["page_size"],
+            "siteKey": self.site["site_key"],
+            "locale": self.site["locale"],
+            "classification": self.search_cfg["classification"],
+            "sortmode": self.search_cfg["sort_mode"],
+            "pageSize": self.search_cfg["page_size"],
         }
+        if where:
+            params["where"] = where
+        if sub_ids:
+            params["subclassification"] = ",".join(str(s) for s in sub_ids)
         if daterange > 0:
             params["daterange"] = daterange
 
+        delay = (self.http["delay_min"], self.http["delay_max"])
         jobs: dict[str, dict] = {}
         total = 0
         received = 0
-        for page in range(1, self.search["max_pages"] + 1):
-            data = self._get({**params, "page": page})
+        for page in range(1, self.search_cfg["max_pages"] + 1):
+            data = self._request("GET", SEARCH_PATH, delay, params={**params, "page": page})
             total = data.get("totalCount") or 0
             batch = data.get("data") or []
             received += len(batch)
@@ -166,116 +252,123 @@ class SeekClient:
                 return list(jobs.values()), received, total, False
         return list(jobs.values()), received, total, True
 
-
-def init_db(path: Path) -> sqlite3.Connection:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS jobs (
-            job_id TEXT PRIMARY KEY,
-            title TEXT,
-            company TEXT,
-            location TEXT,
-            search_location TEXT,
-            work_arrangement TEXT,
-            subclassification TEXT,
-            work_type TEXT,
-            salary TEXT,
-            listed_at TEXT,
-            job_url TEXT,
-            scraped_at TEXT
-        )
-        """
-    )
-    return conn
+    def fetch_description(self, job_id: str) -> str:
+        """Ambil isi lengkap lowongan (teks polos) lewat GraphQL."""
+        delay = (self.http["detail_delay_min"], self.http["detail_delay_max"])
+        body = {"operationName": "jobDetails", "variables": {"id": job_id}, "query": JOB_DETAILS_QUERY}
+        data = self._request("POST", GRAPHQL_PATH, delay, json=body)
+        job = ((data.get("data") or {}).get("jobDetails") or {}).get("job")
+        if not job:
+            self.stats.failed_requests += 1
+            errors = data.get("errors") or []
+            raise FetchError(errors[0].get("message", "tanpa data") if errors else "tanpa data")
+        return html_to_text(job.get("content"))
 
 
-def upsert_jobs(conn: sqlite3.Connection, rows: list[dict]) -> None:
-    cols = ", ".join(FIELDS)
-    placeholders = ", ".join(f":{f}" for f in FIELDS)
-    updates = ", ".join(f"{f} = excluded.{f}" for f in FIELDS if f != "job_id")
-    with conn:
-        conn.executemany(
-            f"INSERT INTO jobs ({cols}) VALUES ({placeholders}) ON CONFLICT(job_id) DO UPDATE SET {updates}",
-            rows,
-        )
-
-
-def export_csv(conn: sqlite3.Connection, path: Path, scraped_at: str | None) -> int:
-    """Export ke CSV. Jika scraped_at diisi, hanya job dari run tersebut (snapshot terbaru)."""
-    query = f"SELECT {', '.join(FIELDS)} FROM jobs"
-    args: tuple = ()
-    if scraped_at:
-        query += " WHERE scraped_at = ?"
-        args = (scraped_at,)
-    query += " ORDER BY listed_at DESC"
-    rows = conn.execute(query, args).fetchall()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(FIELDS)
-        writer.writerows(rows)
-    return len(rows)
-
-
-def run(cfg: dict, daterange: int, csv_path: Path | None, csv_all: bool) -> int:
+def collect_jobs(
+    client: SeekClient,
+    locations: list[str],
+    sub_ids: list[int],
+    daterange: int,
+    on_progress: Callable[[int, int, str], None] | None = None,
+) -> SearchResult:
+    """Jalankan pencarian untuk tiap lokasi dan gabungkan hasilnya tanpa duplikat."""
     scraped_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    sub_names = {str(sub_id): name for name, sub_id in cfg["subclassifications"].items()}
-    stats = Stats()
-    client = SeekClient(cfg, stats)
-    conn = init_db(Path(cfg["storage"]["db_path"]))
-    failed_combos = 0
+    classification = client.search_cfg["classification"]
+    result = SearchResult()
     seen: set[str] = set()
+    targets = locations or [""]
+    for i, where in enumerate(targets):
+        label = where or client.site.get("all_locations_label", "Semua lokasi")
+        if on_progress:
+            on_progress(i, len(targets), label)
+        try:
+            raw_jobs, received, total, truncated = client.search(where, sub_ids, daterange)
+        except FetchError as e:
+            result.failed_locations += 1
+            result.warnings.append(f"{label}: GAGAL ({e})")
+            continue
+        new = 0
+        for raw in raw_jobs:
+            row = parse_job(raw, client.site["base_url"], label, classification, sub_ids, scraped_at)
+            if row["job_id"] not in seen:
+                seen.add(row["job_id"])
+                result.rows.append(row)
+                new += 1
+        dupes = received - len(raw_jobs)
+        result.messages.append(f"{label}: {new} job" + (f" (+{dupes} duplikat promoted dibuang)" if dupes else ""))
+        if truncated:
+            result.warnings.append(
+                f"{label}: batas max_pages={client.search_cfg['max_pages']} tercapai, data kemungkinan "
+                f"TERPOTONG ({received} dari {total}). Perpendek rentang hari atau persempit subklasifikasi."
+            )
+        elif received < total:
+            result.warnings.append(f"{label}: hanya dapat {received} dari {total} item yang dilaporkan API")
+    if on_progress:
+        on_progress(len(targets), len(targets), "")
+    return result
 
-    log.info("Mulai scrape: daterange=%s", f"{daterange} hari" if daterange > 0 else "tanpa filter")
-    try:
-        for where in cfg["locations"]:
-            for name, sub_id in cfg["subclassifications"].items():
-                label = f"{where} x {name}"
-                try:
-                    raw_jobs, received, total, truncated = client.fetch_combination(where, sub_id, daterange)
-                except FetchError as e:
-                    failed_combos += 1
-                    log.error("%s: GAGAL (%s)", label, e)
-                    continue
-                rows = [parse_job(raw, where, sub_names, scraped_at) for raw in raw_jobs]
-                upsert_jobs(conn, rows)
-                seen.update(r["job_id"] for r in rows)
-                dupes = received - len(rows)
-                log.info(
-                    "%s: %d job%s", label, len(rows),
-                    f" (+{dupes} duplikat promoted dibuang)" if dupes else "",
-                )
-                if truncated:
-                    log.warning(
-                        "%s: batas max_pages=%d tercapai, data kemungkinan TERPOTONG (%d dari %d). "
-                        "Perpendek daterange atau naikkan max_pages.",
-                        label, cfg["search"]["max_pages"], received, total,
-                    )
-                elif received < total:
-                    log.warning("%s: hanya dapat %d dari %d item yang dilaporkan API", label, received, total)
 
-        db_total = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
-        log.info(
-            "Selesai: %d job unik di run ini, %d total di database, %d request (%d gagal), %d kombinasi gagal",
-            len(seen), db_total, stats.requests, stats.failed_requests, failed_combos,
-        )
-        if csv_path:
-            n = export_csv(conn, csv_path, None if csv_all else scraped_at)
-            log.info("CSV: %d baris ditulis ke %s", n, csv_path)
-    finally:
-        client.close()
-        conn.close()
-    return 1 if failed_combos else 0
+def add_descriptions(
+    client: SeekClient,
+    rows: list[dict],
+    on_progress: Callable[[int, int, str], None] | None = None,
+) -> int:
+    """Isi kolom description untuk baris yang belum punya. Mengembalikan jumlah yang gagal."""
+    pending = [r for r in rows if r["description"] is None]
+    failed = 0
+    for i, row in enumerate(pending):
+        if on_progress:
+            on_progress(i, len(pending), row["title"] or row["job_id"])
+        try:
+            row["description"] = client.fetch_description(row["job_id"])
+        except FetchError as e:
+            failed += 1
+            log.warning("Deskripsi job %s gagal diambil (%s)", row["job_id"], e)
+    if on_progress:
+        on_progress(len(pending), len(pending), "")
+    return failed
+
+
+def apply_software(rows: list[dict], terms: list[str]) -> list[dict]:
+    """Isi kolom software; jika terms diisi, hanya kembalikan job yang menyebut salah satunya."""
+    if not terms:
+        for row in rows:
+            row["software"] = None
+        return rows
+    matched = []
+    for row in rows:
+        found = match_software(f"{row['title'] or ''}\n{row['description'] or ''}", terms)
+        row["software"] = ", ".join(found) or None
+        if found:
+            matched.append(row)
+    return matched
+
+
+def estimate_detail_seconds(cfg: dict, count: int) -> float:
+    http = cfg["http"]
+    return count * ((http["detail_delay_min"] + http["detail_delay_max"]) / 2 + 0.5)
+
+
+def write_csv(rows: list[dict], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # utf-8-sig supaya Excel membaca karakter non-ASCII dengan benar
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Scrape lowongan Audit (External/Internal) dari au.seek.com")
-    parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.toml"))
-    parser.add_argument("--daterange", type=int, help="N hari terakhir; 0 = tanpa filter (default: dari config)")
-    parser.add_argument("--csv", type=Path, help="export hasil run ini ke file CSV")
-    parser.add_argument("--csv-all", action="store_true", help="export seluruh isi database, bukan hanya run ini")
+    parser = argparse.ArgumentParser(description="Scrape lowongan Accounting dari Seek / JobStreet ke CSV")
+    parser.add_argument("--config", type=Path, default=CONFIG_PATH)
+    parser.add_argument("--site", default="seek_au", help="seek_au atau jobstreet_id (default: seek_au)")
+    parser.add_argument("--location", action="append", help="bisa diulang; default dari config")
+    parser.add_argument("--subclass", action="append", help="nama subklasifikasi, bisa diulang; 'all' = semua Accounting")
+    parser.add_argument("--daterange", type=int, help="N hari terakhir; 0 = tanpa filter")
+    parser.add_argument("--software", help='daftar software dipisah koma, mis. "Xero, MYOB"; kosong = semua job')
+    parser.add_argument("--no-description", action="store_true", help="lewati pengambilan deskripsi (lebih cepat)")
+    parser.add_argument("--csv", type=Path, default=Path("data/jobs.csv"))
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -287,11 +380,55 @@ def main(argv: list[str] | None = None) -> int:
     logging.getLogger("httpx").setLevel(logging.DEBUG if args.verbose else logging.WARNING)
 
     cfg = load_config(args.config)
-    db_path = Path(cfg["storage"]["db_path"])
-    if not db_path.is_absolute():
-        cfg["storage"]["db_path"] = str(args.config.resolve().parent / db_path)
-    daterange = args.daterange if args.daterange is not None else cfg["search"]["daterange"]
-    return run(cfg, daterange, args.csv, args.csv_all)
+    if args.site not in cfg["sites"]:
+        parser.error(f"--site harus salah satu dari: {', '.join(cfg['sites'])}")
+    terms = parse_terms(args.software)
+    if terms and args.no_description:
+        parser.error("--software butuh deskripsi; jangan dipakai bersama --no-description")
+
+    sub_map = cfg["subclassifications"]
+    names = args.subclass or cfg["defaults"]["subclassifications"]
+    if any(n.lower() == "all" for n in names):
+        names = []
+    unknown = [n for n in names if n not in sub_map]
+    if unknown:
+        parser.error(f"subklasifikasi tidak dikenal: {', '.join(unknown)}")
+    sub_ids = [sub_map[n] for n in names]
+    locations = args.location or cfg["sites"][args.site]["default_locations"]
+    daterange = args.daterange if args.daterange is not None else cfg["search"]["default_daterange"]
+
+    client = SeekClient(cfg, args.site)
+    try:
+        log.info(
+            "Mulai: %s | lokasi=%s | subklasifikasi=%s | daterange=%s",
+            cfg["sites"][args.site]["name"], locations, names or "semua Accounting",
+            f"{daterange} hari" if daterange > 0 else "tanpa filter",
+        )
+        result = collect_jobs(client, locations, sub_ids, daterange)
+        for msg in result.messages:
+            log.info(msg)
+        for warning in result.warnings:
+            log.warning(warning)
+        rows = result.rows
+        failed_details = 0
+        if rows and not args.no_description:
+            log.info("Mengambil deskripsi %d job (perkiraan %.0f menit)", len(rows), estimate_detail_seconds(cfg, len(rows)) / 60)
+            failed_details = add_descriptions(
+                client, rows, lambda i, n, _: log.info("Deskripsi %d/%d", i, n) if i and i % 25 == 0 else None
+            )
+        total = len(rows)
+        rows = apply_software(rows, terms)
+        if terms:
+            log.info("Filter software %s: %d dari %d job cocok", terms, len(rows), total)
+        write_csv(rows, args.csv)
+        log.info(
+            "Selesai: %d job ditulis ke %s | %d request (%d gagal), %d lokasi gagal, %d deskripsi gagal",
+            len(rows), args.csv, client.stats.requests, client.stats.failed_requests,
+            result.failed_locations, failed_details,
+        )
+    finally:
+        client.close()
+    return 1 if result.failed_locations or failed_details else 0
 
 
 if __name__ == "__main__":
