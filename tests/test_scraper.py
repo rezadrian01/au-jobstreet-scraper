@@ -7,6 +7,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import ai
 import scraper
 
 BASE_URL = "https://au.seek.com"
@@ -201,3 +202,112 @@ def test_add_descriptions_via_graphql():
     assert failed == 1
     assert [r["description"] for r in rows] == ["Uses Xero", None, "already"]
     assert progress == [(0, 2), (1, 2), (2, 2)]
+
+
+class FakeModels:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = 0
+
+    def generate_content(self, model, contents, config):
+        self.calls += 1
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return type("Resp", (), {"text": response})()
+
+
+class FakeGemini:
+    def __init__(self, responses):
+        self.models = FakeModels(responses)
+
+
+AI_CFG = {"model": "test-model", "max_retries": 2, "backoff_base": 0, "concurrency": 2}
+
+
+def test_format_requirements():
+    assert ai.format_requirements([" 2 years experience ", "- CPA", "", "(Desirable) CIA"]) == (
+        "- 2 years experience\n- CPA\n- (Desirable) CIA"
+    )
+    assert ai.format_requirements([]) == ""
+
+
+def test_extract_requirements_parses_json():
+    client = FakeGemini(['{"requirements": ["2 years experience", "(Desirable) CPA"]}'])
+    assert ai.extract_requirements(client, AI_CFG, "Auditor", "text") == ["2 years experience", "(Desirable) CPA"]
+
+
+def test_extract_requirements_retries_invalid_answer_then_fails():
+    client = FakeGemini(["not json", '{"requirements": ["ok"]}'])
+    assert ai.extract_requirements(client, AI_CFG, "Auditor", "text", sleep=lambda s: None) == ["ok"]
+    assert client.models.calls == 2
+
+    client = FakeGemini(["bad", "bad", "bad"])
+    with pytest.raises(ai.AIError):
+        ai.extract_requirements(client, AI_CFG, "Auditor", "text", sleep=lambda s: None)
+
+
+def test_add_requirements_only_processes_rows_with_description():
+    rows = [
+        {"job_id": "1", "title": "a", "description": "text", "requirements": None},
+        {"job_id": "2", "title": "b", "description": None, "requirements": None},
+        {"job_id": "3", "title": "c", "description": "text", "requirements": "- done"},
+    ]
+    client = FakeGemini(['{"requirements": []}'])
+    progress = []
+    failed, error = ai.add_requirements(client, AI_CFG, rows, lambda i, n, label: progress.append((i, n)))
+    assert (failed, error) == (0, None)
+    assert [r["requirements"] for r in rows] == ["", None, "- done"]
+    assert client.models.calls == 1
+    assert progress == [(0, 1), (1, 1)]
+
+
+GCP_VARS = ["GCP_PROJECT_ID", "GCP_LOCATION", "GCP_CLIENT_EMAIL", "GCP_PRIVATE_KEY"]
+
+
+def write_env(tmp_path, monkeypatch, content):
+    for var in GCP_VARS:
+        monkeypatch.delenv(var, raising=False)
+    env = tmp_path / ".env"
+    env.write_text(content)
+    monkeypatch.setattr(ai, "ENV_PATH", env)
+
+
+def test_load_settings_requires_project(tmp_path, monkeypatch):
+    write_env(tmp_path, monkeypatch, 'GCP_PROJECT_ID=""\n')
+    with pytest.raises(ai.AIError, match="GCP_PROJECT_ID"):
+        ai.load_settings()
+
+
+def test_load_settings_defaults(tmp_path, monkeypatch):
+    write_env(tmp_path, monkeypatch, 'GCP_PROJECT_ID="my-project"\nGCP_LOCATION=""\n')
+    settings = ai.load_settings()
+    assert (settings["project"], settings["location"], settings["client_email"]) == ("my-project", "global", "")
+
+
+def test_service_account_credentials_from_env(tmp_path, monkeypatch):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    pem = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+    ).decode()
+    one_line = pem.replace("\n", "\\n")
+    write_env(
+        tmp_path, monkeypatch,
+        f'GCP_PROJECT_ID="my-project"\nGCP_CLIENT_EMAIL="bot@my-project.iam.gserviceaccount.com"\n'
+        f'GCP_PRIVATE_KEY="{one_line}"\n',
+    )
+    creds = ai._credentials(ai.load_settings())
+    assert creds.service_account_email == "bot@my-project.iam.gserviceaccount.com"
+    assert creds.project_id == "my-project"
+
+
+def test_invalid_private_key_gives_clear_error(tmp_path, monkeypatch):
+    write_env(
+        tmp_path, monkeypatch,
+        'GCP_PROJECT_ID="my-project"\nGCP_CLIENT_EMAIL="bot@my-project.iam.gserviceaccount.com"\n'
+        'GCP_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\\n\\n-----END PRIVATE KEY-----\\n"\n',
+    )
+    with pytest.raises(ai.AIError, match="GCP_PRIVATE_KEY"):
+        ai._credentials(ai.load_settings())

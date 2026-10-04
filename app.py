@@ -8,6 +8,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
+import ai
 import scraper
 
 st.set_page_config(page_title="Job Scraper", page_icon=":mag:", layout="wide")
@@ -19,7 +20,7 @@ class_name = cfg["search"]["classification_name"]
 
 TABLE_COLUMNS = [
     "title", "company", "location", "subclassification", "salary", "listed_at", "software",
-    "work_type", "work_arrangement", "description", "job_url",
+    "work_type", "work_arrangement", "requirements", "description", "job_url",
 ]
 
 
@@ -49,7 +50,32 @@ def fetch_descriptions(site_key: str, rows: list[dict]) -> None:
     st.session_state.detail_failed = failed
 
 
-def run_search(site_key: str, locations: list[str], sub_names: list[str], daterange: int, with_description: bool) -> None:
+def fetch_requirements(rows: list[dict]) -> None:
+    """Ekstrak requirement dengan Gemini untuk baris yang punya deskripsi tetapi belum diproses."""
+    if not ai.pending_rows(rows):
+        return
+    bar = st.progress(0.0, text="Menghubungi Gemini…")
+
+    def on_progress(i: int, n: int, label: str) -> None:
+        bar.progress(i / n if n else 1.0, text=f"Requirement {i}/{n} · {label[:60]}")
+
+    try:
+        failed, error = ai.add_requirements(ai.make_client(), cfg["ai"], rows, on_progress)
+    except ai.AIError as e:
+        failed, error = len(ai.pending_rows(rows)), str(e)
+    bar.empty()
+    st.session_state.ai_error = f"{failed} requirement gagal diekstrak: {error}" if failed else None
+
+
+def run_search(
+    site_key: str,
+    locations: list[str],
+    sub_names: list[str],
+    daterange: int,
+    with_description: bool,
+    with_requirements: bool,
+    terms: list[str],
+) -> None:
     sub_ids = [sub_map[n] for n in sub_names]
     client = scraper.SeekClient(cfg, site_key)
     bar = st.progress(0.0, text="Mencari lowongan…")
@@ -70,8 +96,12 @@ def run_search(site_key: str, locations: list[str], sub_names: list[str], datera
         "fetched_at": datetime.now(),
     }
     st.session_state.detail_failed = 0
+    st.session_state.ai_error = None
     if with_description:
         fetch_descriptions(site_key, result.rows)
+        if with_requirements:
+            # Hanya lowongan yang lolos filter software, supaya tidak membayar untuk yang tidak ditampilkan
+            fetch_requirements(scraper.apply_software(result.rows, terms))
 
 
 def to_frame(rows: list[dict], tz: str) -> pd.DataFrame:
@@ -126,6 +156,13 @@ with st.sidebar:
         value=True,
         help="Wajib untuk filter software. Butuh 1 request per lowongan, jadi lebih lama.",
     )
+    with_requirements = st.checkbox(
+        "Ekstrak requirement dengan AI",
+        value=True,
+        disabled=not with_description,
+        help=f"Gemini ({cfg['ai']['model']}) membaca deskripsi dan mengisi kolom Requirements dengan poin-poin "
+        "requirement. Berbayar, ditagih ke project Google Cloud yang diatur di file .env.",
+    )
     start = st.button("Tarik data", type="primary", width="stretch")
 
 # ---------- Halaman utama ----------
@@ -136,7 +173,10 @@ st.caption("Lowongan Accounting dari Seek Australia dan JobStreet Indonesia. Set
 terms = scraper.parse_terms(software_raw)
 
 if start:
-    run_search(site_key, locations, sub_names, daterange, with_description)
+    run_search(
+        site_key, locations, sub_names, daterange, with_description,
+        with_description and with_requirements, terms,
+    )
 
 search = st.session_state.get("search")
 if not search:
@@ -168,10 +208,18 @@ shown = scraper.apply_software(rows, terms)
 if terms and pending:
     st.info("Lowongan tanpa deskripsi hanya dicocokkan lewat judulnya, jadi hasil filter software belum lengkap.")
 
-col_total, col_shown, col_desc = st.columns(3)
+if st.session_state.get("ai_error"):
+    st.error(st.session_state.ai_error)
+ai_pending = len(ai.pending_rows(shown))
+if ai_pending and st.button(f"Ekstrak requirement {ai_pending} lowongan dengan AI"):
+    fetch_requirements(shown)
+    st.rerun()
+
+col_total, col_shown, col_desc, col_req = st.columns(4)
 col_total.metric("Lowongan ditemukan", len(rows))
 col_shown.metric("Ditampilkan", len(shown), help="Setelah filter software")
 col_desc.metric("Punya deskripsi", len(rows) - pending)
+col_req.metric("Punya requirement", sum(r["requirements"] is not None for r in rows), help="Hasil ekstraksi AI")
 
 if not shown:
     st.info(f"Tidak ada lowongan yang menyebut: {', '.join(terms)}.")
@@ -191,6 +239,7 @@ st.dataframe(
         "software": "Software",
         "work_type": "Work type",
         "work_arrangement": "Arrangement",
+        "requirements": st.column_config.TextColumn("Requirements", width="large", help="Diekstrak oleh AI"),
         "description": st.column_config.TextColumn("Job description", width="large"),
         "job_url": st.column_config.LinkColumn("Link", display_text="Buka"),
     },

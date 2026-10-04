@@ -41,6 +41,7 @@ FIELDS = [
     "listed_at",
     "software",
     "description",
+    "requirements",
     "job_url",
     "scraped_at",
 ]
@@ -163,6 +164,7 @@ def parse_job(raw: dict, base_url: str, search_location: str, classification: in
         "listed_at": normalize_iso(raw.get("listingDate")),
         "software": None,
         "description": None,
+        "requirements": None,
         "job_url": f"{base_url}/job/{job_id}",
         "scraped_at": scraped_at,
     }
@@ -368,6 +370,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--daterange", type=int, help="N hari terakhir; 0 = tanpa filter")
     parser.add_argument("--software", help='daftar software dipisah koma, mis. "Xero, MYOB"; kosong = semua job')
     parser.add_argument("--no-description", action="store_true", help="lewati pengambilan deskripsi (lebih cepat)")
+    parser.add_argument("--requirements", action="store_true", help="ekstrak poin requirement dengan Gemini (Vertex AI)")
     parser.add_argument("--csv", type=Path, default=Path("data/jobs.csv"))
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
@@ -385,6 +388,8 @@ def main(argv: list[str] | None = None) -> int:
     terms = parse_terms(args.software)
     if terms and args.no_description:
         parser.error("--software butuh deskripsi; jangan dipakai bersama --no-description")
+    if args.requirements and args.no_description:
+        parser.error("--requirements butuh deskripsi; jangan dipakai bersama --no-description")
 
     sub_map = cfg["subclassifications"]
     names = args.subclass or cfg["defaults"]["subclassifications"]
@@ -420,15 +425,26 @@ def main(argv: list[str] | None = None) -> int:
         rows = apply_software(rows, terms)
         if terms:
             log.info("Filter software %s: %d dari %d job cocok", terms, len(rows), total)
+        failed_ai = 0
+        if args.requirements and rows:
+            import ai
+
+            log.info("Mengekstrak requirement %d job dengan %s", len(ai.pending_rows(rows)), cfg["ai"]["model"])
+            try:
+                failed_ai, _ = ai.add_requirements(ai.make_client(), cfg["ai"], rows)
+            except ai.AIError as e:
+                log.error("Ekstraksi requirement dibatalkan: %s", e)
+                failed_ai = len(ai.pending_rows(rows))
         write_csv(rows, args.csv)
         log.info(
-            "Selesai: %d job ditulis ke %s | %d request (%d gagal), %d lokasi gagal, %d deskripsi gagal",
+            "Selesai: %d job ditulis ke %s | %d request (%d gagal), %d lokasi gagal, %d deskripsi gagal, "
+            "%d requirement gagal",
             len(rows), args.csv, client.stats.requests, client.stats.failed_requests,
-            result.failed_locations, failed_details,
+            result.failed_locations, failed_details, failed_ai,
         )
     finally:
         client.close()
-    return 1 if result.failed_locations or failed_details else 0
+    return 1 if result.failed_locations or failed_details or failed_ai else 0
 
 
 if __name__ == "__main__":

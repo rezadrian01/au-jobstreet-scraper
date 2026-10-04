@@ -13,13 +13,16 @@ Mengambil data lowongan **Accounting** dari **au.seek.com** dan **id.jobstreet.c
 4. **Date range:** N hari terakhir, maksimal sekitar 30.
 5. **Software:** daftar software opsional; jika diisi, hanya lowongan yang menyebut salah satunya yang diambil.
 
-Data per lowongan yang diminta: job title, job description/requirement, subclass, company, location, salary, tanggal, software.
+6. **Requirement (AI):** kolom `requirements` berisi poin-poin requirement yang diekstrak Gemini dari deskripsi lowongan.
+
+Data per lowongan yang diminta: job title, job description, requirements, subclass, company, location, salary, tanggal, software.
 
 ## Keputusan user
 
 - **UI:** Streamlit, dijalankan lokal (bukan di-hosting).
 - **Tanpa SQLite.** Setiap tarikan mengambil semua data dari situs, tanpa peduli pernah diambil atau belum. Konsekuensinya tidak ada riwayat: lowongan yang sudah hilang dari situs tidak bisa dilihat lagi.
 - **Filter software:** cocok jika menyebut **salah satu** software (OR), dengan kolom yang menunjukkan mana yang cocok.
+- **AI:** Gemini di Vertex AI, ditagih ke project GCP yang diatur user di `.env`. Ekstrak poin requirement termasuk "desirable qualifications".
 - **Cakupan subklasifikasi:** semua di bawah Accounting. Ini asumsi; user belum menjawab apakah klasifikasi lain juga perlu.
 
 ## Hasil discovery (terverifikasi dari request nyata, 3-4 Oktober 2026)
@@ -101,6 +104,17 @@ Tanpa filter tanggal hasilnya sama dengan 31 hari, jadi lowongan tampaknya hanya
 - Daftar 25 subklasifikasi Accounting beserta ID-nya diambil dari halaman listing Seek dan disimpan di `config.toml`.
 - `subclassification` dihilangkan = semua subklasifikasi di bawah klasifikasi.
 
+### Ekstraksi requirement (Vertex AI, 4 Oktober 2026)
+
+- SDK `google-genai` dengan `vertexai=True`, `location="global"`, output JSON terstruktur (`response_schema`), `temperature=0`.
+- Model yang tersedia di project saat itu antara lain `gemini-3.8-flash` dan `gemini-3.5-flash-lite`. Keduanya diuji pada lowongan yang sama: `gemini-3.8-flash` lebih rapi (default); `gemini-3.5-flash-lite` lebih cepat (1,7 vs 4,7 detik) tetapi ikut mengambil satu poin yang bukan requirement.
+- Bekerja untuk deskripsi berbahasa Inggris dan Indonesia; poin dikembalikan dalam bahasa aslinya.
+- Poin opsional diberi awalan `(Desirable) `.
+- Pengaturan GCP ada di `.env` (tidak di-commit; contoh di `.env.example`): `GCP_PROJECT_ID`, `GCP_LOCATION`, `GCP_CLIENT_EMAIL`, `GCP_PRIVATE_KEY`.
+- Urutan autentikasi: service account dari `.env`; jika `GCP_CLIENT_EMAIL` kosong, Application Default Credentials; jika itu juga belum ada, token `gcloud auth print-access-token`. Yang teruji live baru jalur token gcloud; jalur service account hanya teruji lewat unit test dengan key buatan.
+- Jebakan: setelah `pip install` yang meng-upgrade library (mis. `websockets` saat memasang `google-genai`), proses Streamlit yang masih berjalan harus di-restart, kalau tidak muncul `ImportError` dari modul lama yang masih termuat.
+- Harga per panggilan belum dicek.
+
 ### Fallback yang tersedia
 
 - Halaman listing HTML juga bisa diambil dengan HTTP client biasa. Pola URL: `https://au.seek.com/jobs-in-accounting/audit-external/in-All-Sydney-NSW?daterange=7`.
@@ -112,7 +126,7 @@ Tanpa filter tanggal hasilnya sama dengan 31 hari, jadi lowongan tampaknya hanya
 - Batas maksimum `pageSize` dan batas jumlah halaman.
 - Perilaku rate limit saat request lebih sering atau volume lebih besar. Tarikan terbesar yang pernah dijalankan sekitar 20 lowongan dengan deskripsi; tarikan ratusan sampai ribuan lowongan belum pernah diuji.
 - Kestabilan endpoint dan ID dalam jangka panjang (endpoint internal bisa berubah tanpa pemberitahuan).
-- Pagination multi-halaman dan jalur retry 403/429 hanya teruji lewat unit test, belum pernah terpicu terhadap Seek sungguhan.
+- Jalur retry 403/429 hanya teruji lewat unit test, belum pernah terpicu terhadap situs sungguhan. Pagination multi-halaman sudah teruji live (JobStreet, 272 lowongan dalam 3 halaman).
 
 ## Batasan yang diketahui
 
@@ -132,23 +146,25 @@ Rencana awal punya empat tingkat (JSON API, JSON tertanam di HTML, Playwright, C
 | File | Isi |
 |---|---|
 | `app.py` | UI Streamlit: form kriteria, progress, tabel hasil, filter software, download CSV/Excel |
+| `ai.py` | Klien Vertex AI, prompt, dan ekstraksi requirement paralel dengan retry |
 | `scraper.py` | Logika inti (pencarian, pagination, retry, deskripsi, pencocokan software) + CLI yang menulis CSV |
 | `config.toml` | Situs, lokasi, ID subklasifikasi, default, jeda, retry |
 | `tests/test_scraper.py` | Unit test parsing, pagination, duplikat promoted, retry, deskripsi, filter software |
 | `README.md` | Install, cara pakai UI dan CLI |
 
-Stack: Python 3.11+, `httpx`, `streamlit`, `pandas`, `openpyxl`.
+Stack: Python 3.11+, `httpx`, `streamlit`, `pandas`, `openpyxl`, `google-genai`.
 
 ### Kolom output
 
-`job_id`, `title`, `company`, `location`, `search_location`, `subclassification`, `work_type`, `work_arrangement`, `salary`, `listed_at`, `software`, `description`, `job_url`, `scraped_at`.
+`job_id`, `title`, `company`, `location`, `search_location`, `subclassification`, `work_type`, `work_arrangement`, `salary`, `listed_at`, `software`, `description`, `requirements`, `job_url`, `scraped_at`.
 
 ### Yang sudah diuji terhadap situs sungguhan (4 Oktober 2026)
 
 - UI, Seek: Sydney + Melbourne + Brisbane, Audit, 7 hari: 21 lowongan, semua dengan deskripsi; filter software menyaring dengan benar.
 - UI, JobStreet: Jakarta Raya, Audit, 3 hari: 17 lowongan, semua dengan deskripsi.
 - CLI, JobStreet dengan filter software: 3 dari 12 lowongan cocok.
-- Tidak ada request yang gagal. Pagination multi-halaman dan retry tetap hanya teruji lewat unit test.
+- UI dengan AI, Seek: 11 lowongan, semuanya mendapat requirement. JobStreet dengan filter software: 10 dari 38 lowongan diproses AI, 28 sisanya ditawarkan lewat tombol.
+- Tidak ada request yang gagal, jadi jalur retry tetap hanya teruji lewat unit test.
 
 ## Cara kerja yang diharapkan untuk perubahan berikutnya
 

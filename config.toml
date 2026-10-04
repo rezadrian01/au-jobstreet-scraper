@@ -86,3 +86,11 @@ all_locations_label = "Semua kota di Indonesia"
 
 [defaults]
 subclassifications = ["Audit - External", "Audit - Internal"]
+
+# Ekstraksi requirement dengan Gemini di Vertex AI.
+# Project, region, dan kredensial GCP diatur di file .env (lihat .env.example).
+[ai]
+model = "gemini-3.8-flash" # alternatif lebih murah dan cepat: "gemini-3.5-flash-lite"
+concurrency = 5            # jumlah panggilan paralel ke Gemini
+max_retries = 3
+backoff_base = 2.0
