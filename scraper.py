@@ -37,8 +37,11 @@ FIELDS = [
     "subclassification",
     "work_type",
     "work_arrangement",
+    "seniority",
+    "industry",
     "salary",
     "listed_at",
+    "apply_type",
     "software",
     "description",
     "requirements",
@@ -111,26 +114,43 @@ def html_to_text(content: str | None) -> str:
     return "\n".join(line for line in lines if line and line != "-")
 
 
-def parse_terms(raw: str | None) -> list[str]:
-    """Pecah input "Xero, MYOB" (koma atau baris baru) menjadi daftar tanpa duplikat."""
-    terms: list[str] = []
-    for part in re.split(r"[,\n;]", raw or ""):
-        term = part.strip()
-        if term and term.lower() not in (t.lower() for t in terms):
-            terms.append(term)
-    return terms
+def new_row(**values) -> dict:
+    """Baris hasil dengan semua kolom FIELDS; kolom yang tidak diisi bernilai None."""
+    unknown = set(values) - set(FIELDS)
+    if unknown:
+        raise KeyError(f"kolom tidak dikenal: {sorted(unknown)}")
+    return {field: values.get(field) for field in FIELDS}
 
 
-def match_software(text: str | None, terms: list[str]) -> list[str]:
-    """Kembalikan software yang disebut di teks: tanpa peduli huruf besar/kecil, per kata utuh."""
-    if not text:
+LOCATION_SUGGEST_QUERY = """query SearchLocationsSuggest($query: String!, $count: Int!, $recentLocation: String!, $locale: Locale, $country: CountryCodeIso2) {
+  searchLocationsSuggest(query: $query, count: $count, recentLocation: $recentLocation, locale: $locale, country: $country) {
+    suggestions {
+      ... on LocationSuggestion { text }
+    }
+  }
+}"""
+
+
+def suggest_locations(site: dict, http_cfg: dict, query: str, count: int = 8, client: httpx.Client | None = None) -> list[str]:
+    """Saran lokasi dari Seek/JobStreet, sama dengan kolom lokasi di situsnya. Kosong jika gagal."""
+    query = query.strip()
+    if len(query) < 2:
         return []
-    found = []
-    for term in terms:
-        pattern = r"(?<![A-Za-z0-9])" + re.escape(term) + r"(?![A-Za-z0-9])"
-        if re.search(pattern, text, re.IGNORECASE):
-            found.append(term)
-    return found
+    base_url = site["base_url"]
+    body = {
+        "operationName": "SearchLocationsSuggest",
+        "variables": {"query": query, "count": count, "recentLocation": "", "locale": site["locale"], "country": site["country_code"]},
+        "query": LOCATION_SUGGEST_QUERY,
+    }
+    headers = {"User-Agent": http_cfg["user_agent"], "Accept": "application/json", "Origin": base_url, "Referer": base_url + "/"}
+    try:
+        post = client.post if client else httpx.post
+        resp = post(base_url + GRAPHQL_PATH, json=body, headers=headers, timeout=10)
+        suggestions = resp.json()["data"]["searchLocationsSuggest"]["suggestions"]
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
+        log.warning("Saran lokasi gagal diambil (%s)", type(e).__name__)
+        return []
+    return [item["text"] for item in suggestions if item.get("text")]
 
 
 def parse_job(raw: dict, base_url: str, search_location: str, classification: int, sub_ids: list[int], scraped_at: str) -> dict:
@@ -151,23 +171,20 @@ def parse_job(raw: dict, base_url: str, search_location: str, classification: in
         if str(sub.get("id")) in wanted and name not in selected:
             selected.append(name)
     job_id = str(raw["id"])
-    return {
-        "job_id": job_id,
-        "title": raw.get("title"),
-        "company": raw.get("companyName") or (raw.get("advertiser") or {}).get("description"),
-        "location": "; ".join(loc["label"] for loc in raw.get("locations") or [] if loc.get("label")) or None,
-        "search_location": search_location,
-        "subclassification": "; ".join(selected or in_class) or None,
-        "work_type": "; ".join(raw.get("workTypes") or []) or None,
-        "work_arrangement": (raw.get("workArrangements") or {}).get("displayText") or None,
-        "salary": raw.get("salaryLabel") or None,
-        "listed_at": normalize_iso(raw.get("listingDate")),
-        "software": None,
-        "description": None,
-        "requirements": None,
-        "job_url": f"{base_url}/job/{job_id}",
-        "scraped_at": scraped_at,
-    }
+    return new_row(
+        job_id=job_id,
+        title=raw.get("title"),
+        company=raw.get("companyName") or (raw.get("advertiser") or {}).get("description"),
+        location="; ".join(loc["label"] for loc in raw.get("locations") or [] if loc.get("label")) or None,
+        search_location=search_location,
+        subclassification="; ".join(selected or in_class) or None,
+        work_type="; ".join(raw.get("workTypes") or []) or None,
+        work_arrangement=(raw.get("workArrangements") or {}).get("displayText") or None,
+        salary=raw.get("salaryLabel") or None,
+        listed_at=normalize_iso(raw.get("listingDate")),
+        job_url=f"{base_url}/job/{job_id}",
+        scraped_at=scraped_at,
+    )
 
 
 class SeekClient:
@@ -332,19 +349,15 @@ def add_descriptions(
     return failed
 
 
-def apply_software(rows: list[dict], terms: list[str]) -> list[dict]:
-    """Isi kolom software; jika terms diisi, hanya kembalikan job yang menyebut salah satunya."""
-    if not terms:
-        for row in rows:
-            row["software"] = None
+def filter_title(rows: list[dict], keywords: list[str]) -> list[dict]:
+    """Hanya job yang judulnya memuat salah satu keyword (tanpa peduli huruf besar/kecil).
+
+    Pencocokan per potongan teks, jadi "audit" juga cocok dengan "Auditor".
+    """
+    wanted = [k.lower() for k in keywords if k.strip()]
+    if not wanted:
         return rows
-    matched = []
-    for row in rows:
-        found = match_software(f"{row['title'] or ''}\n{row['description'] or ''}", terms)
-        row["software"] = ", ".join(found) or None
-        if found:
-            matched.append(row)
-    return matched
+    return [r for r in rows if any(k in (r["title"] or "").lower() for k in wanted)]
 
 
 def estimate_detail_seconds(cfg: dict, count: int) -> float:
@@ -368,9 +381,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--location", action="append", help="bisa diulang; default dari config")
     parser.add_argument("--subclass", action="append", help="nama subklasifikasi, bisa diulang; 'all' = semua Accounting")
     parser.add_argument("--daterange", type=int, help="N hari terakhir; 0 = tanpa filter")
-    parser.add_argument("--software", help='daftar software dipisah koma, mis. "Xero, MYOB"; kosong = semua job')
     parser.add_argument("--no-description", action="store_true", help="lewati pengambilan deskripsi (lebih cepat)")
-    parser.add_argument("--requirements", action="store_true", help="ekstrak poin requirement dengan Gemini (Vertex AI)")
+    parser.add_argument("--requirements", action="store_true", help="ekstrak requirement dan software dengan Gemini (Vertex AI)")
     parser.add_argument("--csv", type=Path, default=Path("data/jobs.csv"))
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
@@ -385,9 +397,8 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(args.config)
     if args.site not in cfg["sites"]:
         parser.error(f"--site harus salah satu dari: {', '.join(cfg['sites'])}")
-    terms = parse_terms(args.software)
-    if terms and args.no_description:
-        parser.error("--software butuh deskripsi; jangan dipakai bersama --no-description")
+    if cfg["sites"][args.site].get("type", "seek") != "seek":
+        parser.error("Sumber ini hanya tersedia lewat UI (streamlit run app.py)")
     if args.requirements and args.no_description:
         parser.error("--requirements butuh deskripsi; jangan dipakai bersama --no-description")
 
@@ -421,10 +432,6 @@ def main(argv: list[str] | None = None) -> int:
             failed_details = add_descriptions(
                 client, rows, lambda i, n, _: log.info("Deskripsi %d/%d", i, n) if i and i % 25 == 0 else None
             )
-        total = len(rows)
-        rows = apply_software(rows, terms)
-        if terms:
-            log.info("Filter software %s: %d dari %d job cocok", terms, len(rows), total)
         failed_ai = 0
         if args.requirements and rows:
             import ai

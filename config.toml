@@ -25,6 +25,7 @@ name = "Seek Australia (au.seek.com)"
 base_url = "https://au.seek.com"
 site_key = "AU-Main"
 locale = "en-AU"
+country_code = "AU"
 timezone = "Australia/Sydney"
 locations = [
     "All Sydney NSW",
@@ -35,7 +36,7 @@ locations = [
     "All Canberra ACT",
     "All Australia",
 ]
-default_locations = ["All Sydney NSW", "All Melbourne VIC", "All Brisbane QLD"]
+default_locations = []     # kosong = seluruh Australia; lokasi dipilih lewat kotak "Cari lokasi"
 all_locations_label = "Semua lokasi di Australia"
 
 [sites.jobstreet_id]
@@ -43,6 +44,7 @@ name = "JobStreet Indonesia (id.jobstreet.com)"
 base_url = "https://id.jobstreet.com"
 site_key = "ID-Main"
 locale = "en-ID"
+country_code = "ID"
 timezone = "Asia/Jakarta"
 locations = [
     "Jakarta Raya",
@@ -56,7 +58,58 @@ locations = [
 default_locations = []     # kosong = semua kota di Indonesia
 all_locations_label = "Semua kota di Indonesia"
 
-# Subklasifikasi di bawah Accounting. ID sama di kedua situs.
+# LinkedIn lewat JobSpy (endpoint tamu, tanpa login). Tidak punya subklasifikasi seperti Seek,
+# jadi penyaringannya berbasis keyword. Tanggal posting hanya sampai tingkat hari.
+[sites.linkedin_id]
+name = "LinkedIn Indonesia (linkedin.com)"
+type = "linkedin"
+jobspy_site = "linkedin"
+base_url = "https://www.linkedin.com"
+timezone = "Asia/Jakarta"
+date_only = true
+locations = ["Indonesia"]
+default_locations = []     # kosong = seluruh Indonesia
+all_locations_label = "Indonesia"
+keyword_suggestions = ["audit", "auditor", "internal audit", "external audit"]
+default_keywords = ["audit"]
+max_results = 300          # default batas hasil per keyword x lokasi (bisa diubah di UI); LinkedIn berhenti di 1.000
+batch_size = 25            # hasil per panggilan pencarian; progress bar bergerak tiap batch
+
+# Indeed lewat JobSpy, tanpa login. Hasil pencarian sudah termasuk deskripsi. Berbasis keyword.
+[sites.indeed_id]
+name = "Indeed Indonesia (id.indeed.com)"
+type = "indeed"
+jobspy_site = "indeed"
+country_indeed = "Indonesia"
+base_url = "https://id.indeed.com"
+timezone = "Asia/Jakarta"
+date_only = true
+locations = ["Indonesia"]
+default_locations = []     # kosong = seluruh Indonesia
+all_locations_label = "Indonesia"
+keyword_suggestions = ["audit", "auditor", "internal audit", "external audit"]
+default_keywords = ["audit"]
+max_results = 300          # default batas hasil per keyword x lokasi (bisa diubah di UI)
+batch_size = 50            # hasil per panggilan pencarian; progress bar bergerak tiap batch
+
+# Glints lewat actor Apify (https://apify.com/truefetch/glints-job-listing). Berbayar per hasil
+# ($0,005 per lowongan + $0,01 per run), ditagih ke akun Apify pemilik APIFY_TOKEN di .env.
+# Glints sendiri mewajibkan login untuk pencarian, jadi tidak diakses langsung.
+[sites.glints_id]
+name = "Glints Indonesia (glints.com, via Apify)"
+type = "glints"
+base_url = "https://glints.com"
+timezone = "Asia/Jakarta"
+actor = "truefetch~glints-job-listing"
+country = "Indonesia"
+locations = []
+default_locations = []     # kosong = semua kota di Indonesia
+all_locations_label = "Semua kota di Indonesia"
+keyword_suggestions = ["audit", "auditor", "internal audit", "external audit"]
+default_keywords = ["audit"]
+max_results = 100          # default batas hasil per keyword x lokasi (bisa diubah di UI); menentukan biaya
+
+# Subklasifikasi di bawah Accounting. ID sama di kedua situs Seek/JobStreet.
 [subclassifications]
 "Accounts Officers/Clerks" = 6140
 "Accounts Payable" = 1303

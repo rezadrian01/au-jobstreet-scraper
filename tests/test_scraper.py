@@ -8,6 +8,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import ai
+import glints
+import jobspy_sources
 import scraper
 
 BASE_URL = "https://au.seek.com"
@@ -68,31 +70,6 @@ def test_html_to_text():
     html = "<p>Proficiency in <strong>Xero</strong>&nbsp;or comparable systems</p><ul><li>CPA</li><li>Excel</li></ul>"
     assert scraper.html_to_text(html) == "Proficiency in Xero or comparable systems\n- CPA\n- Excel"
     assert scraper.html_to_text(None) == ""
-
-
-def test_parse_terms():
-    assert scraper.parse_terms(" Xero, MYOB\nxero ; SAP ") == ["Xero", "MYOB", "SAP"]
-    assert scraper.parse_terms("") == []
-
-
-def test_match_software_whole_word_case_insensitive():
-    text = "Proficiency in XERO or comparable accounting systems. Disappointing sapling."
-    assert scraper.match_software(text, ["Xero", "SAP", "MYOB"]) == ["Xero"]
-    assert scraper.match_software("Experience with SAP/Oracle and MS Excel", ["sap", "MS Excel"]) == ["sap", "MS Excel"]
-    assert scraper.match_software(None, ["Xero"]) == []
-
-
-def test_apply_software_filters_to_any_match():
-    rows = [
-        {"title": "Accountant", "description": "Must know Xero", "software": None},
-        {"title": "Auditor", "description": "Excel skills", "software": None},
-        {"title": "MYOB Bookkeeper", "description": None, "software": None},
-    ]
-    matched = scraper.apply_software(rows, ["Xero", "MYOB"])
-    assert [r["title"] for r in matched] == ["Accountant", "MYOB Bookkeeper"]
-    assert [r["software"] for r in rows] == ["Xero", None, "MYOB"]
-    assert scraper.apply_software(rows, []) == rows
-    assert all(r["software"] is None for r in rows)
 
 
 def test_pagination_runs_until_total_reached():
@@ -159,6 +136,12 @@ def test_retry_then_success_counts_failures():
     jobs, *_ = client.search("All Sydney NSW", [6144], 7)
     assert len(jobs) == 1
     assert (stats.requests, stats.failed_requests) == (3, 2)
+
+
+def test_add_requirements_leaves_software_none_when_ad_names_none():
+    rows = [{"job_id": "1", "title": "a", "description": "text", "requirements": None, "software": None}]
+    ai.add_requirements(FakeGemini(['{"requirements": ["CPA"], "software": []}']), AI_CFG, rows)
+    assert rows[0]["requirements"] == "- CPA" and rows[0]["software"] is None
 
 
 def test_gives_up_after_max_retries():
@@ -233,13 +216,21 @@ def test_format_requirements():
 
 
 def test_extract_requirements_parses_json():
-    client = FakeGemini(['{"requirements": ["2 years experience", "(Desirable) CPA"]}'])
-    assert ai.extract_requirements(client, AI_CFG, "Auditor", "text") == ["2 years experience", "(Desirable) CPA"]
+    client = FakeGemini(['{"requirements": ["2 years experience", "(Desirable) CPA"], "software": ["SAP"]}'])
+    assert ai.extract_requirements(client, AI_CFG, "Auditor", "text") == {
+        "requirements": ["2 years experience", "(Desirable) CPA"],
+        "software": ["SAP"],
+    }
+
+
+def test_format_software_dedupes_case_insensitively():
+    assert ai.format_software(["Microsoft Excel", " SAP ", "microsoft excel", ""]) == "Microsoft Excel, SAP"
+    assert ai.format_software([]) == ""
 
 
 def test_extract_requirements_retries_invalid_answer_then_fails():
     client = FakeGemini(["not json", '{"requirements": ["ok"]}'])
-    assert ai.extract_requirements(client, AI_CFG, "Auditor", "text", sleep=lambda s: None) == ["ok"]
+    assert ai.extract_requirements(client, AI_CFG, "Auditor", "text", sleep=lambda s: None) == {"requirements": ["ok"], "software": []}
     assert client.models.calls == 2
 
     client = FakeGemini(["bad", "bad", "bad"])
@@ -249,15 +240,16 @@ def test_extract_requirements_retries_invalid_answer_then_fails():
 
 def test_add_requirements_only_processes_rows_with_description():
     rows = [
-        {"job_id": "1", "title": "a", "description": "text", "requirements": None},
-        {"job_id": "2", "title": "b", "description": None, "requirements": None},
-        {"job_id": "3", "title": "c", "description": "text", "requirements": "- done"},
+        {"job_id": "1", "title": "a", "description": "text", "requirements": None, "software": None},
+        {"job_id": "2", "title": "b", "description": None, "requirements": None, "software": None},
+        {"job_id": "3", "title": "c", "description": "text", "requirements": "- done", "software": "SAP"},
     ]
-    client = FakeGemini(['{"requirements": []}'])
+    client = FakeGemini(['{"requirements": [], "software": ["Xero", "MYOB"]}'])
     progress = []
     failed, error = ai.add_requirements(client, AI_CFG, rows, lambda i, n, label: progress.append((i, n)))
     assert (failed, error) == (0, None)
     assert [r["requirements"] for r in rows] == ["", None, "- done"]
+    assert [r["software"] for r in rows] == ["Xero, MYOB", None, "SAP"]
     assert client.models.calls == 1
     assert progress == [(0, 1), (1, 1)]
 
@@ -311,3 +303,245 @@ def test_invalid_private_key_gives_clear_error(tmp_path, monkeypatch):
     )
     with pytest.raises(ai.AIError, match="GCP_PRIVATE_KEY"):
         ai._credentials(ai.load_settings())
+
+
+LINKEDIN_RECORD = {
+    "id": "li-4473870600",
+    "title": "Internal Auditor",
+    "company": "PT Contoh",
+    "location": "Jakarta, Indonesia",
+    "date_posted": __import__("datetime").date(2026, 10, 3),
+    "job_type": "fulltime",
+    "is_remote": False,
+    "min_amount": float("nan"),
+    "max_amount": float("nan"),
+    "job_function": None,
+    "description": "**Requirements**\n\n* 2 years\\-experience\n* Proficient in SAP",
+    "job_url": "https://www.linkedin.com/jobs/view/4473870600",
+}
+
+
+def test_linkedin_clean_markdown():
+    assert jobspy_sources.clean_markdown("**Requirements**\n\n* 2 years\\-experience\n+ CPA\n## About") == (
+        "Requirements\n- 2 years-experience\n- CPA\nAbout"
+    )
+    assert jobspy_sources.clean_markdown(None) is None
+
+
+def test_linkedin_parse_job():
+    row = jobspy_sources.parse_job(LINKEDIN_RECORD, "Indonesia", "t")
+    assert set(row) == set(scraper.FIELDS)
+    assert row["job_id"] == "li-4473870600"
+    assert row["listed_at"] == "2026-10-03"
+    assert row["work_type"] == "Full time"
+    assert row["work_arrangement"] is None and row["salary"] is None and row["subclassification"] is None
+    assert row["description"] == "Requirements\n- 2 years-experience\n- Proficient in SAP"
+
+
+def test_linkedin_salary_formatting():
+    record = {**LINKEDIN_RECORD, "min_amount": 8000000.0, "max_amount": 12000000.0, "currency": "IDR", "interval": "monthly"}
+    assert jobspy_sources.parse_job(record, "Indonesia", "t")["salary"] == "IDR 8,000,000 – 12,000,000 monthly"
+
+
+def test_linkedin_collect_pages_dedupes_and_warns(monkeypatch):
+    import jobspy
+    import pandas as pd
+
+    calls = []
+    pages = {
+        ("audit", 0): ["li-1", "li-2"], ("audit", 2): ["li-2", "li-3"],
+        ("auditor", 0): ["li-3"],
+        ("big", 0): ["li-5", "li-6"], ("big", 2): ["li-7", "li-8"],
+    }
+
+    def fake_scrape_jobs(**kwargs):
+        calls.append(kwargs)
+        if kwargs["search_term"] == "boom":
+            raise RuntimeError("429")
+        ids = pages[(kwargs["search_term"], kwargs["offset"])]
+        return pd.DataFrame([{**LINKEDIN_RECORD, "id": i} for i in ids])
+
+    monkeypatch.setattr(jobspy, "scrape_jobs", fake_scrape_jobs)
+    site = {"all_locations_label": "Indonesia", "batch_size": 2, "jobspy_site": "linkedin"}
+    progress = []
+    result = jobspy_sources.collect_jobs(
+        site, ["audit", "auditor", "boom", "big"], [], 7, 4, lambda i, n, label: progress.append((i, n)), sleep=lambda s: None
+    )
+    assert sum(c["search_term"] == "boom" for c in calls) == jobspy_sources.BATCH_RETRIES + 1
+    assert [r["job_id"] for r in result.rows] == ["li-1", "li-2", "li-3", "li-5", "li-6", "li-7", "li-8"]
+    assert calls[0]["location"] == "Indonesia" and calls[0]["hours_old"] == 168 and calls[0]["fetch_description"] is False
+    assert result.messages[0] == 'Indonesia · "audit": 3 job'
+    assert result.failed_locations == 1
+    # "audit" dan "big" berhenti di max_results (terpotong), "boom" gagal
+    assert len(result.warnings) == 3 and sum("berhenti di batas 4 hasil" in w for w in result.warnings) == 2
+    assert progress[0] == (0, 16) and progress[-1] == (1, 1)
+
+
+def test_indeed_collect_passes_country_and_keeps_descriptions(monkeypatch):
+    import jobspy
+    import pandas as pd
+
+    calls = []
+
+    def fake_scrape_jobs(**kwargs):
+        calls.append(kwargs)
+        return pd.DataFrame([{**LINKEDIN_RECORD, "id": "in-1", "location": "Jakarta, JW, ID"}])
+
+    monkeypatch.setattr(jobspy, "scrape_jobs", fake_scrape_jobs)
+    site = {"all_locations_label": "Indonesia", "batch_size": 50, "jobspy_site": "indeed", "country_indeed": "Indonesia"}
+    result = jobspy_sources.collect_jobs(site, ["audit"], [], 3, 100)
+    assert calls[0]["site_name"] == ["indeed"] and calls[0]["country_indeed"] == "Indonesia" and calls[0]["hours_old"] == 72
+    assert [r["job_id"] for r in result.rows] == ["in-1"]
+    assert result.rows[0]["description"].startswith("Requirements")
+
+
+LINKEDIN_DETAIL_HTML = """<section>
+<div class="show-more-less-html__markup x"><p>Uses <b>Xero</b></p><ul><li>CPA</li></ul></div>
+<ul><li class="description__job-criteria-item"><h3> Seniority level </h3><span> Not Applicable </span></li>
+<li class="description__job-criteria-item"><h3> Employment type </h3><span> Full-time </span></li>
+<li class="description__job-criteria-item"><h3> Industries </h3><span> Banking </span></li></ul>
+<a data-tracking-control-name="public_jobs_apply-link-offsite">Apply</a></section>"""
+
+
+def test_linkedin_parse_details():
+    details = jobspy_sources.parse_details(LINKEDIN_DETAIL_HTML)
+    assert details == {
+        "description": "Uses Xero\n- CPA",
+        "work_type": "Full-time",
+        "industry": "Banking",
+        "apply_type": "External (situs perusahaan)",
+    }
+    easy = jobspy_sources.parse_details(LINKEDIN_DETAIL_HTML.replace("apply-link-offsite", "apply-link-onsite"))
+    assert easy["apply_type"] == "Easy Apply"
+    with pytest.raises(scraper.FetchError):
+        jobspy_sources.parse_details("<html>login wall</html>")
+
+
+def test_linkedin_add_descriptions_fills_details():
+    def handler(request):
+        if request.url.path.endswith("/2"):
+            return httpx.Response(404)
+        return httpx.Response(200, text=LINKEDIN_DETAIL_HTML)
+
+    client = httpx.Client(base_url="https://www.linkedin.com", transport=httpx.MockTransport(handler))
+    rows = [
+        scraper.new_row(job_id="li-1", title="a"),
+        scraper.new_row(job_id="li-2", title="b"),
+        scraper.new_row(job_id="li-3", title="c", description="already"),
+    ]
+    failed = jobspy_sources.add_descriptions(make_cfg(), {"base_url": "https://www.linkedin.com"}, rows, sleep=lambda s: None, client=client)
+    assert failed == 1
+    assert [r["description"] for r in rows] == ["Uses Xero\n- CPA", None, "already"]
+    assert (rows[0]["work_type"], rows[0]["industry"], rows[0]["apply_type"]) == ("Full-time", "Banking", "External (situs perusahaan)")
+    assert rows[2]["work_type"] is None
+
+
+def test_new_row_rejects_unknown_columns():
+    assert set(scraper.new_row(job_id="1")) == set(scraper.FIELDS)
+    with pytest.raises(KeyError):
+        scraper.new_row(nope=1)
+
+
+def test_suggest_locations():
+    def handler(request):
+        body = json.loads(request.content)
+        assert body["variables"] == {"query": "jak", "count": 8, "recentLocation": "", "locale": "en-ID", "country": "ID"}
+        return httpx.Response(200, json={"data": {"searchLocationsSuggest": {"suggestions": [{"text": "Jakarta Raya"}, {}, {"text": "Jakarta Selatan Jakarta Raya"}]}}})
+
+    site = {"base_url": "https://id.jobstreet.com", "locale": "en-ID", "country_code": "ID"}
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert scraper.suggest_locations(site, {"user_agent": "test"}, " jak ", client=client) == ["Jakarta Raya", "Jakarta Selatan Jakarta Raya"]
+    assert scraper.suggest_locations(site, {"user_agent": "test"}, "j", client=client) == []
+    broken = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(500, text="oops")))
+    assert scraper.suggest_locations(site, {"user_agent": "test"}, "jak", client=broken) == []
+
+
+def test_filter_title_matches_any_keyword_as_substring():
+    rows = [{"title": "Senior Auditor"}, {"title": "Inventory Control Staff"}, {"title": "TAX Consultant"}, {"title": None}]
+    assert [r["title"] for r in scraper.filter_title(rows, ["audit", "tax"])] == ["Senior Auditor", "TAX Consultant"]
+    assert scraper.filter_title(rows, []) == rows
+
+
+GLINTS_SITE = {"actor": "user~actor", "country": "Indonesia", "all_locations_label": "Semua kota di Indonesia"}
+
+GLINTS_ITEM = {
+    "platform_url": "https://glints.com/id/opportunities/jobs/audit-warehouse/753cbcb8-d23b",
+    "title": "Audit Warehouse",
+    "posted_date": "2099-01-02T02:42:18.547475Z",
+    "location": {"raw": "Penjaringan", "country": "Indonesia"},
+    "is_remote": False,
+    "description": "Job description\n- Stock opname",
+    "job_type": "Full-time",
+    "job_function": "Auditor",
+    "work_mode": "",
+    "salary_period": "monthly",
+    "salary_minimum": 5500000,
+    "salary_maximum": 6500000,
+    "salary_currency": "IDR",
+    "company_name": "PT Sumber Sejahtera",
+}
+
+
+def test_glints_parse_job():
+    row = glints.parse_job(GLINTS_ITEM, "Semua kota di Indonesia", "t")
+    assert set(row) == set(scraper.FIELDS)
+    assert row["job_id"] == "gl-753cbcb8-d23b"
+    assert row["salary"] == "IDR 5,500,000 – 6,500,000 monthly"
+    assert row["listed_at"] == "2099-01-02T02:42:18+00:00"
+    assert (row["location"], row["subclassification"], row["work_arrangement"]) == ("Penjaringan", "Auditor", None)
+
+
+def test_glints_collect_runs_actor_filters_old_and_reports_failure():
+    started = []
+
+    def handler(request):
+        path = request.url.path
+        if path.endswith("/acts/user~actor/runs"):
+            body = json.loads(request.content)
+            started.append(body)
+            if body["keyword"] == "boom":
+                return httpx.Response(402)
+            return httpx.Response(201, json={"data": {"id": "run1", "status": "READY", "defaultDatasetId": "ds1"}})
+        if path.endswith("/actor-runs/run1"):
+            return httpx.Response(200, json={"data": {"id": "run1", "status": "SUCCEEDED", "defaultDatasetId": "ds1"}})
+        if path.endswith("/datasets/ds1/items"):
+            old = {**GLINTS_ITEM, "platform_url": "https://glints.com/x/old", "posted_date": "2020-01-01T00:00:00Z"}
+            return httpx.Response(200, json=[GLINTS_ITEM, GLINTS_ITEM, old])
+        return httpx.Response(404)
+
+    client = httpx.Client(base_url=glints.APIFY_BASE, transport=httpx.MockTransport(handler))
+    result = glints.collect_jobs(GLINTS_SITE, ["audit", "boom"], [], 7, 50, client=client, sleep=lambda s: None)
+    assert [r["job_id"] for r in result.rows] == ["gl-753cbcb8-d23b"]
+    assert started[0]["max_results"] == 50 and started[0]["country"] == "Indonesia" and "location" not in started[0]
+    assert len(started[0]["posted_since"]) == 10
+    assert "1 lowongan yang diposting lebih lama dibuang" in result.messages[0]
+    assert result.failed_locations == 1 and "Kredit Apify" in result.warnings[0]
+
+
+def test_glints_missing_token_is_reported(tmp_path, monkeypatch):
+    monkeypatch.delenv("APIFY_TOKEN", raising=False)
+    monkeypatch.setattr(glints, "ENV_PATH", tmp_path / ".env")
+    result = glints.collect_jobs(GLINTS_SITE, ["audit"], [], 7, 50)
+    assert result.rows == [] and "APIFY_TOKEN" in result.warnings[0]
+
+
+def test_jobspy_batch_retries_when_error_logged_with_empty_result(monkeypatch):
+    import logging
+
+    import jobspy
+    import pandas as pd
+
+    calls = []
+
+    def fake_scrape_jobs(**kwargs):
+        calls.append(kwargs)
+        if len(calls) < 3:
+            logging.getLogger("JobSpy:Indeed").error("Indeed: Connection reset by peer")
+            return pd.DataFrame()
+        return pd.DataFrame([{**LINKEDIN_RECORD, "id": "in-1"}])
+
+    monkeypatch.setattr(jobspy, "scrape_jobs", fake_scrape_jobs)
+    site = {"all_locations_label": "Indonesia", "batch_size": 50, "jobspy_site": "indeed", "country_indeed": "Indonesia"}
+    result = jobspy_sources.collect_jobs(site, ["audit"], [], 3, 100, sleep=lambda s: None)
+    assert len(calls) == 3 and [r["job_id"] for r in result.rows] == ["in-1"]
+    assert result.warnings == [] and result.failed_locations == 0

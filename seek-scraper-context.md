@@ -115,11 +115,81 @@ Tanpa filter tanggal hasilnya sama dengan 31 hari, jadi lowongan tampaknya hanya
 - Jebakan: setelah `pip install` yang meng-upgrade library (mis. `websockets` saat memasang `google-genai`), proses Streamlit yang masih berjalan harus di-restart, kalau tidak muncul `ImportError` dari modul lama yang masih termuat.
 - Harga per panggilan belum dicek.
 
+### LinkedIn dan Glints (4 Oktober 2026)
+
+**LinkedIn** ditambahkan sebagai sumber ketiga (`jobspy_sources.py`, situs `linkedin_id` di `config.toml`):
+
+- Diambil lewat library `python-jobspy` (MIT), yang memakai endpoint tamu LinkedIn tanpa login:
+  `/jobs-guest/jobs/api/seeMoreJobPostings/search` (10 lowongan per halaman, berhenti di 1.000) dan
+  `/jobs-guest/jobs/api/jobPosting/{id}` untuk deskripsi. Endpoint itu juga diuji langsung dan bekerja.
+- Tidak ada taksonomi subklasifikasi; penyaringan lewat keyword, yang dicocokkan ke seluruh isi lowongan
+  sehingga hasilnya berisik (mis. "Manufacturing Quality Technician" muncul untuk "audit").
+- Tanggal posting hanya tingkat hari; gaji kosong di semua hasil uji.
+- Pencarian halaman LinkedIn melaporkan 439 hasil untuk 7 hari.
+- Rancangan pertama (satu panggilan JobSpy per keyword, deskripsi ikut diambil) membuat progress bar diam
+  berpuluh menit dan dilaporkan user sebagai "stuck". Sekarang pencarian dipecah per batch 25 hasil
+  (`offset`) tanpa deskripsi, lalu deskripsi diambil sendiri dari endpoint tamu hanya untuk lowongan yang
+  lolos filter judul. Uji live: "audit", 3 hari: 135 lowongan, 9 lolos filter judul, selesai 106 detik
+  termasuk deskripsi dan AI.
+- Opsi "Keyword harus ada di judul" (default aktif) dan keyword ganda ditambahkan atas permintaan user.
+- `joeyism/linkedin_scraper` ditolak: wajib login akun, pencarian lowongan tanpa filter tanggal atau
+  pagination, GPL-3.0.
+
+**Indeed Indonesia** ditambahkan sebagai sumber (situs `indeed_id`), atas pilihan user setelah survei portal
+gratis pengganti Glints:
+
+- Lewat JobSpy (`site_name=["indeed"]`, `country_indeed="Indonesia"`), tanpa login; hasil pencarian sudah
+  termasuk deskripsi, jadi tidak ada tahap deskripsi terpisah. Paging lewat `offset`, 50 per batch.
+- Uji live lewat UI: "audit", 7 hari: 150 lowongan dalam 42 detik, 15 lolos filter judul, semuanya mendapat
+  requirement AI. Gaji terisi di sebagian kecil lowongan.
+- Jebakan: koneksi dari jaringan user ke Indeed sering ter-reset (`ConnectionResetError`), dan JobSpy
+  menelan error itu lalu mengembalikan hasil kosong. `jobspy_sources.py` mendeteksinya lewat log JobSpy dan
+  mencoba ulang batch sampai 6 kali; jika tetap gagal, hasil parsial dipertahankan dengan peringatan.
+- Portal lain yang diuji aksesnya (belum dipasang): Kalibrr (JSON API `/kjs/job_board/search`, ada kolom
+  `qualifications`, 55 lowongan "audit"), Dealls (`api.sejutacita.id`, 6 lowongan), Karirhub Kemnaker
+  (`api.kemnaker.go.id`, 31 lowongan, agregator termasuk Glints dan Kalibrr), Loker.id dan KitaLulus (HTML).
+  Jora diblok Cloudflare.
+
+**Glints** ditambahkan sebagai sumber lewat Apify (`glints.py`, situs `glints_id`):
+
+- Tanpa login, API pencarian (`/api/v2-alc/graphql?op=searchJobsV3`) hanya mengembalikan 4 lowongan yang
+  tidak terkait keyword, lalu muncul dialog login.
+- Semua scraper open-source yang ditemukan memakai login (cookie atau email/password).
+- Pilihan yang diambil: actor Apify `truefetch~glints-job-listing` ($0,005 per hasil + $0,01 per run,
+  tanpa login Glints). Token di `.env` sebagai `APIFY_TOKEN`; akun user paket FREE ($5 per bulan).
+- Input actor: `keyword`, `country`, `max_results` (wajib), `location`, `posted_since`, `remote_only`,
+  `job_type`, `currency`. Hasil sudah termasuk deskripsi, gaji, dan `job_function`.
+- Jebakan: `posted_since` tidak menyaring berdasarkan tanggal posting. Uji live "audit", 7 hari, 20 hasil:
+  hanya 5 yang benar-benar diposting dalam 7 hari; 15 sisanya lebih lama (sampai Juni) dan dibuang di sisi
+  kita, tetapi tetap ditagih.
+- Jebakan: koneksi dari jaringan user ke `api.apify.com` sering ter-reset (kira-kira 2 dari 3 percobaan);
+  klien mencoba ulang otomatis.
+
 ### Fallback yang tersedia
 
 - Halaman listing HTML juga bisa diambil dengan HTTP client biasa. Pola URL: `https://au.seek.com/jobs-in-accounting/audit-external/in-All-Sydney-NSW?daterange=7`.
 - Data job tertanam di `window.SEEK_REDUX_DATA` (`results.results.jobs`), dengan jumlah yang cocok dengan API.
 - Fallback ini belum diimplementasikan karena API langsung sudah bekerja, dan hanya berlaku untuk Seek (lihat JobStreet di atas).
+
+## Revisi 6 Oktober 2026 (masukan klien)
+
+- **Filter software dihapus sepenuhnya** (keputusan user, membalik rancangan awal). Kolom `software`
+  sekarang diisi AI dalam panggilan yang sama dengan requirement (`ai.py`, skema JSON berisi
+  `requirements` dan `software`), bisa lebih dari satu per lowongan, dengan nama produk dinormalkan
+  (mis. "Ms. Excel" menjadi "Microsoft Excel"). `match_software`, `apply_software`, `parse_terms`, dan
+  opsi CLI `--software` dibuang.
+- **Autocomplete lokasi Seek/JobStreet:** query GraphQL `searchLocationsSuggest` di `{base_url}/graphql`
+  (variabel `query`, `count`, `recentLocation`, `locale`, `country`), tanpa login, bekerja di kedua situs.
+  Di UI memakai komponen `streamlit-searchbox`; lokasi yang dipilih masuk ke multiselect "Lokasi terpilih".
+- **Kolom LinkedIn yang kosong:** saat pencarian LinkedIn dipecah per batch, pengambilan detail diganti
+  versi sendiri yang hanya mengambil deskripsi, sehingga jenis pekerjaan hilang (bug). Sekarang
+  `jobspy_sources.parse_details` juga mengambil Employment type, Seniority level, Industries, dan jenis
+  lamaran (Easy Apply vs external) dari halaman tamu yang sama.
+- **Kolom baru:** `seniority`, `industry`, `apply_type`. Semua parser memakai `scraper.new_row()` supaya
+  kolomnya selalu lengkap. UI dan file unduhan menyembunyikan kolom yang kosong di semua baris.
+- **Easy Apply vs external:** dari 16 halaman tamu yang diperiksa (8 dan 8), kolom yang tersedia sama;
+  deskripsi lowongan external rata-rata lebih panjang (3.450 vs 1.300 karakter).
+- **Pemakaian token nyata** per lowongan (6 sampel): sekitar 550 input, 130 output, 330 token "thinking".
 
 ## Yang belum terverifikasi
 
@@ -147,12 +217,14 @@ Rencana awal punya empat tingkat (JSON API, JSON tertanam di HTML, Playwright, C
 |---|---|
 | `app.py` | UI Streamlit: form kriteria, progress, tabel hasil, filter software, download CSV/Excel |
 | `ai.py` | Klien Vertex AI, prompt, dan ekstraksi requirement paralel dengan retry |
+| `jobspy_sources.py` | Pencarian LinkedIn dan Indeed lewat JobSpy (per batch, dengan coba-ulang), deskripsi LinkedIn dari endpoint tamu |
+| `glints.py` | Klien Apify dan pemetaan hasil actor Glints ke kolom scraper |
 | `scraper.py` | Logika inti (pencarian, pagination, retry, deskripsi, pencocokan software) + CLI yang menulis CSV |
 | `config.toml` | Situs, lokasi, ID subklasifikasi, default, jeda, retry |
 | `tests/test_scraper.py` | Unit test parsing, pagination, duplikat promoted, retry, deskripsi, filter software |
 | `README.md` | Install, cara pakai UI dan CLI |
 
-Stack: Python 3.11+, `httpx`, `streamlit`, `pandas`, `openpyxl`, `google-genai`.
+Stack: Python 3.11+, `httpx`, `streamlit`, `pandas`, `openpyxl`, `google-genai`, `python-jobspy`.
 
 ### Kolom output
 

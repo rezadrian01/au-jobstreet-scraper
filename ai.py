@@ -1,4 +1,4 @@
-"""Ekstraksi requirement lowongan dengan Gemini di Vertex AI."""
+"""Ekstraksi requirement dan software lowongan dengan Gemini di Vertex AI."""
 
 from __future__ import annotations
 
@@ -17,9 +17,9 @@ log = logging.getLogger("seek.ai")
 
 DESIRABLE_PREFIX = "(Desirable) "
 
-SYSTEM_INSTRUCTION = f"""You extract candidate requirements from job advertisements.
+SYSTEM_INSTRUCTION = f"""You extract candidate requirements and software from job advertisements.
 
-Return every requirement the candidate must or should meet: experience, skills, knowledge, education, \
+"requirements": return every requirement the candidate must or should meet: experience, skills, knowledge, education, \
 certifications, licences, software proficiency, eligibility (such as citizenship, work rights or clearances) \
 and personal attributes.
 
@@ -28,12 +28,25 @@ Rules:
 - Do not include job responsibilities or duties, company descriptions, benefits, salary, or application instructions.
 - One requirement per item. Keep each item close to the original wording and in the original language of the ad.
 - Do not invent or infer requirements that the ad does not state.
-- If the ad states no requirements, return an empty list."""
+- If the ad states no requirements, return an empty list.
+
+"software": return every software product, application, system or tool the ad names as something the \
+candidate should know or will use (for example Microsoft Excel, SAP, Xero, Accurate, Power BI, ACL).
+
+Rules:
+- One entry per product, no duplicates. Write each product by its common official name \
+(for example "Ms. Excel" becomes "Microsoft Excel", "MS Office" becomes "Microsoft Office").
+- Only products the ad names explicitly. Do not include generic phrases such as "accounting software", \
+"ERP" or "computer", and do not infer products that are not named.
+- If the ad names no software, return an empty list."""
 
 RESPONSE_SCHEMA = {
     "type": "OBJECT",
-    "properties": {"requirements": {"type": "ARRAY", "items": {"type": "STRING"}}},
-    "required": ["requirements"],
+    "properties": {
+        "requirements": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "software": {"type": "ARRAY", "items": {"type": "STRING"}},
+    },
+    "required": ["requirements", "software"],
 }
 
 RETRY_CODES = {429, 500, 502, 503, 504}
@@ -118,8 +131,18 @@ def format_requirements(items: list[str]) -> str:
     return "\n".join(f"- {item}" for item in cleaned if item)
 
 
-def extract_requirements(client, ai_cfg: dict, title: str | None, description: str, sleep=time.sleep) -> list[str]:
-    """Kembalikan daftar poin requirement dari satu deskripsi lowongan."""
+def format_software(items: list[str]) -> str:
+    """Gabungkan nama software menjadi satu teks, tanpa duplikat (tanpa peduli huruf besar/kecil)."""
+    names: list[str] = []
+    for item in items:
+        name = item.strip()
+        if name and name.lower() not in (n.lower() for n in names):
+            names.append(name)
+    return ", ".join(names)
+
+
+def extract_requirements(client, ai_cfg: dict, title: str | None, description: str, sleep=time.sleep) -> dict:
+    """Kembalikan {"requirements": [...], "software": [...]} dari satu deskripsi lowongan."""
     from google.genai import errors, types
 
     config = types.GenerateContentConfig(
@@ -135,7 +158,10 @@ def extract_requirements(client, ai_cfg: dict, title: str | None, description: s
         try:
             resp = client.models.generate_content(model=ai_cfg["model"], contents=prompt, config=config)
             data = json.loads(resp.text or "")
-            return [str(item) for item in data["requirements"]]
+            return {
+                "requirements": [str(item) for item in data["requirements"]],
+                "software": [str(item) for item in data.get("software") or []],
+            }
         except errors.APIError as e:
             if e.code in (401, 403):
                 raise AIError(f"Akses Vertex AI ditolak ({e.code}): {e.message}") from e
@@ -162,7 +188,7 @@ def add_requirements(
     rows: list[dict],
     on_progress: Callable[[int, int, str], None] | None = None,
 ) -> tuple[int, str | None]:
-    """Isi kolom requirements untuk baris yang punya deskripsi tetapi belum diproses.
+    """Isi kolom requirements dan software untuk baris yang punya deskripsi tetapi belum diproses.
 
     Mengembalikan (jumlah gagal, pesan error terakhir).
     """
@@ -179,7 +205,9 @@ def add_requirements(
         for done, future in enumerate(as_completed(futures), start=1):
             row = futures[future]
             try:
-                row["requirements"] = format_requirements(future.result())
+                extracted = future.result()
+                row["requirements"] = format_requirements(extracted["requirements"])
+                row["software"] = format_software(extracted["software"]) or None
             except AIError as e:
                 failed += 1
                 last_error = str(e)
