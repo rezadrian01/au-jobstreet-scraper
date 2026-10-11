@@ -3,9 +3,16 @@
 Panduan ini memasang aplikasi di satu VM Google Cloud, diakses langsung lewat alamat IP (tanpa domain),
 dengan log audit yang tersimpan di Cloud Logging.
 
-**Status panduan:** disusun dari dokumentasi Google Cloud dan kode aplikasi, tetapi belum pernah
-dijalankan dari awal sampai akhir. Di project `intervyou-2`, Compute Engine API bahkan belum aktif saat
-panduan ini ditulis (11 Oktober 2026). Jalankan langkah demi langkah dan periksa hasil tiap langkah.
+**Status panduan:** langkah-langkah ini sudah dijalankan pada 11 Oktober 2026 di project `intervyou-2`
+dan menghasilkan deployment yang berjalan:
+
+| | |
+|---|---|
+| Alamat aplikasi | <http://34.101.58.69:8501> |
+| VM | `job-scraper`, `e2-small`, Ubuntu 24.04, zona `asia-southeast2-a` (Jakarta) |
+| Service account VM | `job-scraper-vm@intervyou-2.iam.gserviceaccount.com` |
+| Firewall | `job-scraper-allow-web`: port 8501 terbuka untuk semua alamat IP (keputusan pemilik) |
+| Hasil uji dari VM | JobStreet, Seek, saran lokasi, dan Gemini bisa diakses; log audit masuk ke Cloud Logging |
 
 ## Gambaran
 
@@ -19,8 +26,9 @@ Yang perlu diketahui sebelum mulai:
 
 - **Tanpa domain berarti tanpa HTTPS.** Lalu lintas antara browser dan VM tidak terenkripsi, jadi akses
   dibatasi hanya untuk alamat IP tertentu lewat firewall (Langkah 4). Jangan membuka port ke seluruh internet.
-- **Belum diuji apakah Seek dan JobStreet menerima permintaan dari IP Compute Engine.** Langkah 8
-  mengujinya sebelum aplikasi dipakai sungguhan.
+- **Seek dan JobStreet menerima permintaan dari IP VM ini** saat diuji (11 Oktober 2026). Langkah 8
+  mengulang uji itu; jalankan lagi kalau suatu saat semua tarikan mulai gagal. LinkedIn, Indeed, dan Glints
+  belum diuji dari VM.
 - **VM menimbulkan biaya selama menyala.** Cek perkiraannya di <https://cloud.google.com/products/calculator>.
 
 ## Prasyarat
@@ -77,7 +85,12 @@ export VM_IP=$(gcloud compute addresses describe "${VM_NAME}-ip" --region="$REGI
 echo "Alamat aplikasi nanti: http://${VM_IP}:8501"
 ```
 
-Buka port 8501 hanya untuk alamat IP yang boleh mengakses. Cari IP publik tiap pengguna dengan membuka
+Deployment yang berjalan sekarang membuka port 8501 untuk **semua** alamat IP (`--source-ranges="0.0.0.0/0"`),
+sesuai keputusan pemilik. Artinya siapa pun yang tahu alamatnya bisa memakai aplikasi dan menghabiskan
+kredit Gemini serta Apify, dan lalu lintasnya tidak terenkripsi. Untuk membatasinya nanti, pakai perintah
+`update` di bawah.
+
+Cara yang lebih aman adalah membuka port hanya untuk alamat IP tertentu. Cari IP publik tiap pengguna dengan membuka
 <https://ifconfig.me> dari jaringan masing-masing, lalu masukkan dipisah koma:
 
 ```bash
@@ -125,6 +138,9 @@ sudo -u jobscraper python3 -m venv /opt/job-scraper/venv
 sudo -u jobscraper /opt/job-scraper/venv/bin/pip install -r /opt/job-scraper/app/requirements.txt
 ```
 
+Folder `/opt/job-scraper` hanya bisa dibaca oleh user `jobscraper`. Karena itu semua perintah di dalamnya
+dijalankan dengan `sudo -u jobscraper`, dan `cd /opt/job-scraper/app` dari user biasa akan ditolak.
+
 Jika repository GitHub-nya privat, `git clone` akan meminta login. Buat personal access token di GitHub
 (izin baca repository) dan pakai sebagai password.
 
@@ -149,9 +165,8 @@ sudo chmod 600 /opt/job-scraper/app/.env
 Pastikan situs sumber menerima permintaan dari IP VM sebelum memasang service:
 
 ```bash
-cd /opt/job-scraper/app
-sudo -u jobscraper /opt/job-scraper/venv/bin/python scraper.py \
-  --site jobstreet_id --daterange 3 --csv /tmp/uji.csv
+sudo -u jobscraper bash -c 'cd /opt/job-scraper/app && /opt/job-scraper/venv/bin/python scraper.py \
+  --site jobstreet_id --daterange 3 --csv /tmp/uji.csv'
 ```
 
 Hasil yang diharapkan: baris `Selesai: N job ditulis ...` dengan `0 lokasi gagal` dan `0 deskripsi gagal`.
@@ -161,8 +176,8 @@ akan berguna dari server ini; hentikan di sini dan pertimbangkan region lain.
 Uji juga akses ke Gemini:
 
 ```bash
-sudo -u jobscraper /opt/job-scraper/venv/bin/python scraper.py \
-  --site jobstreet_id --daterange 3 --requirements --csv /tmp/uji-ai.csv
+sudo -u jobscraper bash -c 'cd /opt/job-scraper/app && /opt/job-scraper/venv/bin/python scraper.py \
+  --site jobstreet_id --daterange 3 --requirements --csv /tmp/uji-ai.csv'
 ```
 
 Baris terakhir harus menyebut `0 requirement gagal`.
@@ -267,22 +282,30 @@ sudo journalctl -u job-scraper --since "2026-10-11 19:30" --until "2026-10-11 20
 Di Cloud Logging, dari laptop:
 
 ```bash
-gcloud logging read 'resource.type="gce_instance" AND "jobscraper.audit"' \
-  --freshness=7d --limit=100 --format="value(timestamp,jsonPayload.MESSAGE,textPayload)"
+LOG='logName="projects/intervyou-2/logs/journald" AND jsonPayload._SYSTEMD_UNIT="job-scraper.service"'
+
+# semua kejadian audit 7 hari terakhir
+gcloud logging read "$LOG AND \"jobscraper.audit\"" --freshness=7d --limit=100 \
+  --format="value(jsonPayload.MESSAGE)"
 
 # hanya tarikan yang terputus
-gcloud logging read 'resource.type="gce_instance" AND "pull_interrupted"' --freshness=30d
+gcloud logging read "$LOG AND \"pull_interrupted\"" --freshness=30d --format="value(jsonPayload.MESSAGE)"
 
-# semua kejadian dari satu tarikan
-gcloud logging read 'resource.type="gce_instance" AND "abc12345"' --freshness=30d
+# semua kejadian dari satu tarikan (ganti dengan pull_id-nya)
+gcloud logging read "$LOG AND \"b2711793\"" --freshness=30d --format="value(jsonPayload.MESSAGE)"
 ```
 
-Atau lewat konsol: <https://console.cloud.google.com/logs/query>, lalu isi kolom query dengan
-`resource.type="gce_instance" "jobscraper.audit"`.
+Atau lewat konsol: <https://console.cloud.google.com/logs/query>, lalu isi kolom query dengan:
 
-Log baru muncul di Cloud Logging satu sampai dua menit setelah kejadian. Nama kolom persis di Cloud Logging
-(`jsonPayload.MESSAGE` atau `textPayload`) belum saya verifikasi; pencarian dengan teks seperti di atas
-bekerja di kolom mana pun.
+```
+logName="projects/intervyou-2/logs/journald"
+jsonPayload._SYSTEMD_UNIT="job-scraper.service"
+"jobscraper.audit"
+```
+
+Log muncul di Cloud Logging kurang dari satu menit setelah kejadian. Isi barisnya ada di kolom
+`jsonPayload.MESSAGE`. Baris yang sama juga muncul sekali lagi di log bernama `syslog`; filter `logName` di
+atas mencegah hasil ganda.
 
 ### Masa simpan log
 
