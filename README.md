@@ -143,6 +143,12 @@ Logika yang sama tanpa UI, menulis CSV:
 
 `--subclass all` = semua subklasifikasi Accounting. Lihat `--help` untuk semua opsi.
 
+## Log audit dan deploy ke server
+
+Aplikasi mencatat tiap tarikan (dimulai, tiap tahap, selesai, terputus, diunduh) sebagai satu baris log
+`jobscraper.audit` di stderr. Panduan memasang aplikasi di Google Compute Engine dan mengirim log itu ke
+Cloud Logging ada di [deploy-gce.md](deploy-gce.md).
+
 ## Test
 
 ```bash

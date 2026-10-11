@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
 
+import httpx
 from dotenv import load_dotenv
 
 log = logging.getLogger("seek.ai")
@@ -50,6 +51,7 @@ RESPONSE_SCHEMA = {
 }
 
 RETRY_CODES = {429, 500, 502, 503, 504}
+REQUEST_TIMEOUT_MS = 90_000  # batas waktu satu panggilan Gemini
 
 ENV_PATH = Path(__file__).with_name(".env")
 SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
@@ -117,12 +119,16 @@ def _credentials(settings: dict):
 def make_client():
     from google import genai
 
+    from google.genai import types
+
     settings = load_settings()
     return genai.Client(
         vertexai=True,
         project=settings["project"],
         location=settings["location"],
         credentials=_credentials(settings),
+        # Tanpa batas waktu, satu panggilan yang menggantung menahan seluruh tahap AI selamanya
+        http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
     )
 
 
@@ -168,6 +174,10 @@ def extract_requirements(client, ai_cfg: dict, title: str | None, description: s
             if e.code not in RETRY_CODES or attempt == retries:
                 raise AIError(f"Gemini error {e.code}: {e.message}") from e
             reason = f"HTTP {e.code}"
+        except httpx.TransportError as e:  # batas waktu habis atau koneksi terputus
+            if attempt == retries:
+                raise AIError(f"Gemini tidak merespons ({type(e).__name__})") from e
+            reason = type(e).__name__
         except (ValueError, KeyError, TypeError) as e:
             if attempt == retries:
                 raise AIError(f"Jawaban Gemini tidak bisa dibaca ({type(e).__name__})") from e

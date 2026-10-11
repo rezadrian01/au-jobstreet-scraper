@@ -238,6 +238,15 @@ def test_extract_requirements_retries_invalid_answer_then_fails():
         ai.extract_requirements(client, AI_CFG, "Auditor", "text", sleep=lambda s: None)
 
 
+def test_extract_requirements_retries_timeouts_then_reports():
+    client = FakeGemini([httpx.ReadTimeout("timed out"), '{"requirements": ["ok"], "software": []}'])
+    assert ai.extract_requirements(client, AI_CFG, "Auditor", "text", sleep=lambda s: None)["requirements"] == ["ok"]
+
+    client = FakeGemini([httpx.ReadTimeout("timed out")] * 3)
+    with pytest.raises(ai.AIError, match="tidak merespons"):
+        ai.extract_requirements(client, AI_CFG, "Auditor", "text", sleep=lambda s: None)
+
+
 def test_add_requirements_only_processes_rows_with_description():
     rows = [
         {"job_id": "1", "title": "a", "description": "text", "requirements": None, "software": None},
@@ -545,3 +554,16 @@ def test_jobspy_batch_retries_when_error_logged_with_empty_result(monkeypatch):
     result = jobspy_sources.collect_jobs(site, ["audit"], [], 3, 100, sleep=lambda s: None)
     assert len(calls) == 3 and [r["job_id"] for r in result.rows] == ["in-1"]
     assert result.warnings == [] and result.failed_locations == 0
+
+
+def test_audit_event_writes_one_searchable_line(capsys):
+    import audit
+
+    audit.setup()
+    audit.setup()  # aman dipanggil berulang: tidak menggandakan handler
+    audit.event("pull_started", site="jobstreet_id", locations=["Jakarta Raya"], pull_id="abc123")
+    lines = [line for line in capsys.readouterr().err.splitlines() if "pull_started" in line]
+    assert len(lines) == 1
+    assert "jobscraper.audit pull_started {" in lines[0]
+    payload = json.loads(lines[0].split("pull_started ", 1)[1])
+    assert payload == {"site": "jobstreet_id", "locations": ["Jakarta Raya"], "pull_id": "abc123"}

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import io
+import time
+import uuid
 from datetime import datetime
 
 import pandas as pd
@@ -10,11 +12,13 @@ import streamlit as st
 from streamlit_searchbox import st_searchbox
 
 import ai
+import audit
 import glints
 import jobspy_sources
 import scraper
 
 st.set_page_config(page_title="Job Scraper", page_icon=":mag:", layout="wide")
+audit.setup()
 
 cfg = scraper.load_config()
 sites = cfg["sites"]
@@ -38,12 +42,27 @@ def fmt_minutes(seconds: float) -> str:
     return "kurang dari 1 menit" if minutes < 1 else f"±{minutes:.0f} menit"
 
 
+def log_event(name: str, **fields) -> None:
+    """Catat kejadian audit, dilengkapi sesi browser, alamat IP, dan ID tarikan yang sedang aktif."""
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+        session = (get_script_run_ctx().session_id or "")[:8]
+    except Exception:
+        session = None
+    search = st.session_state.get("search") or {}
+    fields.setdefault("pull_id", st.session_state.get("pull_id") or search.get("pull_id"))
+    audit.event(name, session=session, ip=getattr(st.context, "ip_address", None), **fields)
+
+
 def fetch_descriptions(site_key: str, rows: list[dict]) -> None:
     """Ambil deskripsi untuk baris yang belum punya; rows diubah di tempat supaya hasil
     parsial tetap tersimpan kalau proses dihentikan."""
     pending = sum(r["description"] is None for r in rows)
     if not pending:
         return
+    started = time.monotonic()
+    log_event("descriptions_started", site=site_key, requested=pending)
     bar = st.progress(0.0)
 
     def on_progress(i: int, n: int, label: str) -> None:
@@ -60,12 +79,19 @@ def fetch_descriptions(site_key: str, rows: list[dict]) -> None:
             client.close()
     bar.empty()
     st.session_state.detail_failed = failed
+    log_event(
+        "descriptions_finished", site=site_key, requested=pending, failed=failed,
+        still_missing=sum(r["description"] is None for r in rows), seconds=round(time.monotonic() - started),
+    )
 
 
 def fetch_requirements(rows: list[dict]) -> None:
     """Ekstrak requirement dan software dengan Gemini untuk baris yang punya deskripsi tetapi belum diproses."""
-    if not ai.pending_rows(rows):
+    requested = len(ai.pending_rows(rows))
+    if not requested:
         return
+    started = time.monotonic()
+    log_event("ai_started", requested=requested, model=cfg["ai"]["model"])
     bar = st.progress(0.0, text="Menghubungi Gemini…")
 
     def on_progress(i: int, n: int, label: str) -> None:
@@ -77,6 +103,7 @@ def fetch_requirements(rows: list[dict]) -> None:
         failed, error = len(ai.pending_rows(rows)), str(e)
     bar.empty()
     st.session_state.ai_error = f"{failed} lowongan gagal dianalisis AI: {error}" if failed else None
+    log_event("ai_finished", requested=requested, failed=failed, error=error, seconds=round(time.monotonic() - started))
 
 
 def site_type(site_key: str) -> str:
@@ -95,6 +122,47 @@ def run_search(
     title_only: bool,
     max_results: int,
 ) -> None:
+    """Jalankan satu tarikan penuh dan catat tiap tahapnya di log audit.
+
+    Streamlit menghentikan skrip dengan exception khusus (turunan BaseException) saat halaman dijalankan
+    ulang atau koneksi browser putus; itu ditangkap di sini supaya tarikan yang terputus ikut tercatat.
+    """
+    started = time.monotonic()
+    st.session_state.pull_id = uuid.uuid4().hex[:8]
+    log_event(
+        "pull_started", site=site_key, locations=locations, subclassifications=sub_names, keywords=keywords,
+        daterange=daterange, with_description=with_description, with_ai=with_requirements,
+        title_only=title_only, max_results=max_results,
+    )
+    try:
+        _run_search(site_key, locations, sub_names, keywords, daterange, with_description, with_requirements, title_only, max_results)
+    except BaseException as e:
+        rows = (st.session_state.get("search") or {}).get("rows") or []
+        log_event(
+            "pull_interrupted", reason=type(e).__name__, detail=str(e)[:200], found=len(rows),
+            with_description=sum(r["description"] is not None for r in rows),
+            analyzed=sum(r["requirements"] is not None for r in rows), seconds=round(time.monotonic() - started),
+        )
+        raise
+    rows = st.session_state.search["rows"]
+    log_event(
+        "pull_finished", found=len(rows), with_description=sum(r["description"] is not None for r in rows),
+        analyzed=sum(r["requirements"] is not None for r in rows), seconds=round(time.monotonic() - started),
+    )
+
+
+def _run_search(
+    site_key: str,
+    locations: list[str],
+    sub_names: list[str],
+    keywords: list[str],
+    daterange: int,
+    with_description: bool,
+    with_requirements: bool,
+    title_only: bool,
+    max_results: int,
+) -> None:
+    search_started = time.monotonic()
     bar = st.progress(0.0, text="Mencari lowongan…")
 
     def on_progress(i: int, n: int, label: str) -> None:
@@ -112,6 +180,7 @@ def run_search(
             client.close()
     bar.empty()
     st.session_state.search = {
+        "pull_id": st.session_state.pull_id,
         "site_key": site_key,
         "keywords": keywords,
         "rows": result.rows,
@@ -121,6 +190,10 @@ def run_search(
     }
     st.session_state.detail_failed = 0
     st.session_state.ai_error = None
+    log_event(
+        "search_finished", site=site_key, found=len(result.rows), failed_searches=result.failed_locations,
+        messages=result.messages, warnings=result.warnings, seconds=round(time.monotonic() - search_started),
+    )
     if with_description:
         # Hanya lowongan yang lolos filter judul, supaya tidak mengambil deskripsi yang tidak ditampilkan
         candidates = candidate_rows(result.rows, keywords, title_only)
@@ -350,6 +423,11 @@ st.dataframe(
 )
 
 stamp = f"{search['site_key']}_{search['fetched_at']:%Y%m%d_%H%M}"
+download_info = {
+    "rows": len(shown),
+    "missing_description": sum(r["description"] is None for r in shown),
+    "not_analyzed": sum(r["requirements"] is None for r in shown),
+}
 col_csv, col_xlsx, _ = st.columns([1, 1, 4])
 col_csv.download_button(
     "Download CSV",
@@ -357,6 +435,9 @@ col_csv.download_button(
     file_name=f"jobs_{stamp}.csv",
     mime="text/csv",
     width="stretch",
+    on_click=log_event,
+    args=("download",),
+    kwargs={"format": "csv", **download_info},
 )
 col_xlsx.download_button(
     "Download Excel",
@@ -364,4 +445,7 @@ col_xlsx.download_button(
     file_name=f"jobs_{stamp}.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     width="stretch",
+    on_click=log_event,
+    args=("download",),
+    kwargs={"format": "xlsx", **download_info},
 )
