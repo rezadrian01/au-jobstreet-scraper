@@ -147,7 +147,8 @@ Logika yang sama tanpa UI, menulis CSV:
 
 Aplikasi mencatat tiap tarikan (dimulai, tiap tahap, selesai, terputus, diunduh) sebagai satu baris log
 `jobscraper.audit` di stderr. Panduan memasang aplikasi di Google Compute Engine dan mengirim log itu ke
-Cloud Logging ada di [deploy-gce.md](deploy-gce.md).
+Cloud Logging ada di [deploy-gce.md](deploy-gce.md). Deployment yang sudah berjalan dikelola dengan
+`./manage.sh` (status, update, log, audit, firewall); lihat `./manage.sh help`.
 
 ## Test
 

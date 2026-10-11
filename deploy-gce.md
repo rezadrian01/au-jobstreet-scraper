@@ -14,6 +14,31 @@ dan menghasilkan deployment yang berjalan:
 | Firewall | `job-scraper-allow-web`: port 8501 terbuka untuk semua alamat IP (keputusan pemilik) |
 | Hasil uji dari VM | JobStreet, Seek, saran lokasi, dan Gemini bisa diakses; log audit masuk ke Cloud Logging |
 
+## Mengelola deployment: `manage.sh`
+
+Setelah terpasang, pekerjaan sehari-hari cukup lewat skrip `manage.sh` dari laptop (butuh `gcloud` yang
+sudah login). Langkah manual di bawah hanya diperlukan untuk pemasangan awal atau perbaikan.
+
+| Perintah | Kegunaan |
+|---|---|
+| `./manage.sh status` | Ringkasan: VM, alamat, service, versi kode, firewall, kejadian audit terakhir |
+| `./manage.sh update` | Ambil kode terbaru dari GitHub, pasang dependensi, restart |
+| `./manage.sh restart` | Restart aplikasi |
+| `./manage.sh logs 200` / `logs -f` | Log aplikasi: 200 baris terakhir, atau diikuti langsung |
+| `./manage.sh audit "-2h"` | Kejadian audit sejak waktu tertentu (default hari ini) |
+| `./manage.sh audit-cloud 30d` | Kejadian audit dari Cloud Logging |
+| `./manage.sh interrupted` | Tarikan yang terputus dalam 30 hari terakhir |
+| `./manage.sh pull b2711793` | Semua kejadian dari satu tarikan berdasarkan `pull_id` |
+| `./manage.sh test` | Uji dari VM apakah JobStreet, Seek, dan saran lokasi bisa diakses |
+| `./manage.sh set-env APIFY_TOKEN` | Ganti satu nilai di `.env` server (diketik tersembunyi), lalu restart |
+| `./manage.sh firewall` | Lihat siapa yang boleh mengakses |
+| `./manage.sh firewall allow IP1,IP2` / `allow-me` / `open` | Batasi ke IP tertentu, ke IP komputer ini, atau buka untuk semua |
+| `./manage.sh stop` / `start` | Matikan atau nyalakan VM |
+| `./manage.sh ssh` | Masuk ke VM |
+
+Perintah yang me-restart aplikasi, mematikan VM, atau membuka firewall meminta konfirmasi dulu; awali dengan
+`ASSUME_YES=1` untuk melewatinya. `./manage.sh help` menampilkan daftar lengkap.
+
 ## Gambaran
 
 ```
