@@ -275,12 +275,16 @@ class SeekClient:
         return list(jobs.values()), received, total, True
 
     def count(self, where: str, sub_ids: list[int], daterange: int) -> int:
-        """Jumlah lowongan yang dilaporkan situs untuk satu pencarian (1 request kecil)."""
+        """Jumlah lowongan yang dilaporkan situs untuk satu pencarian (1 request kecil).
+
+        Angkanya perkiraan: dengan pageSize 1-2 situs melaporkan jumlah yang jauh terlalu kecil (132 untuk
+        pencarian yang berisi 1.709 lowongan), jadi dipakai pageSize 20.
+        """
         params = {
             "siteKey": self.site["site_key"],
             "locale": self.site["locale"],
             "classification": self.search_cfg["classification"],
-            "pageSize": 1,
+            "pageSize": 20,
             "page": 1,
         }
         if where:
@@ -356,10 +360,17 @@ def collect_jobs(
                 searches = [sub_ids]
             raw_jobs: list[dict] = []
             received = 0
-            for part in searches:
+            pending = list(searches)
+            while pending:
+                part = pending.pop(0)
                 if on_progress and len(searches) > 1:
                     on_progress(i, len(targets), f"{label} · dipecah per subklasifikasi ({len(raw_jobs)} lowongan)")
                 jobs, got, part_total, truncated = client.search(where, part, daterange)
+                if truncated and len(searches) == 1 and len(split_ids) > 1:
+                    # Jumlah dari situs hanya perkiraan; kalau ternyata terpotong, pecah sekarang
+                    searches = pending = [[s] for s in split_ids]
+                    raw_jobs, received = [], 0
+                    continue
                 raw_jobs.extend(jobs)
                 received += got
                 if truncated:

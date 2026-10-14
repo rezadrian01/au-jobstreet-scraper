@@ -235,7 +235,7 @@ def test_collect_jobs_splits_by_subclassification_above_cap(monkeypatch):
     def handler(request):
         params = request.url.params
         calls.append((params.get("subclassification"), params["pageSize"]))
-        if params["pageSize"] == "1":
+        if params["pageSize"] == "20":
             return httpx.Response(200, json={"totalCount": 5, "data": []})
         ids = {"6144": ["1", "2"], "6145": ["2", "3", "4"]}[params["subclassification"]]
         return httpx.Response(200, json={"totalCount": len(ids), "data": [{**RAW_JOB, "id": i} for i in ids]})
@@ -243,7 +243,7 @@ def test_collect_jobs_splits_by_subclassification_above_cap(monkeypatch):
     client, _ = make_client(handler, page_size=100)
     result = scraper.collect_jobs(client, ["All Sydney NSW"], [], 31, all_sub_ids=[6144, 6145])
     assert [r["job_id"] for r in result.rows] == ["1", "2", "3", "4"]
-    assert calls[0] == (None, "1")  # hitung dulu, lalu pecah
+    assert calls[0] == (None, "20")  # hitung dulu, lalu pecah
     assert [c[0] for c in calls[1:]] == ["6144", "6145"]
     assert "dipecah jadi 2 pencarian" in result.messages[0] and result.warnings == []
 
@@ -253,11 +253,34 @@ def test_collect_jobs_single_search_below_cap():
 
     def handler(request):
         calls.append(request.url.params["pageSize"])
-        return httpx.Response(200, json={"totalCount": 2, "data": [] if request.url.params["pageSize"] == "1" else [{**RAW_JOB, "id": i} for i in ("1", "2")]})
+        return httpx.Response(200, json={"totalCount": 2, "data": [] if request.url.params["pageSize"] == "20" else [{**RAW_JOB, "id": i} for i in ("1", "2")]})
 
     client, _ = make_client(handler, page_size=100)
     result = scraper.collect_jobs(client, ["All Sydney NSW"], [6145], 7, all_sub_ids=[6144, 6145])
-    assert calls == ["1", "100"] and len(result.rows) == 2
+    assert calls == ["20", "100"] and len(result.rows) == 2
+
+
+def test_collect_jobs_splits_when_count_underestimates(monkeypatch):
+    # Hitungan awal bilang 2 (di bawah batas), tetapi pencarian gabungan ternyata terpotong
+    monkeypatch.setattr(scraper, "SEEK_RESULT_CAP", 3)
+    calls = []
+
+    def handler(request):
+        params = request.url.params
+        sub, page = params.get("subclassification"), params["page"]
+        calls.append(sub)
+        if params["pageSize"] == "20":
+            return httpx.Response(200, json={"totalCount": 2, "data": []})
+        if sub is None:
+            data = [{**RAW_JOB, "id": i} for i in ("1", "2", "3")] if page == "1" else []
+            return httpx.Response(200, json={"totalCount": 9 if page == "1" else 0, "data": data})
+        ids = {"6144": ["1", "5"], "6145": ["2", "3", "4"]}[sub]
+        return httpx.Response(200, json={"totalCount": len(ids), "data": [{**RAW_JOB, "id": i} for i in ids]})
+
+    client, _ = make_client(handler, page_size=100)
+    result = scraper.collect_jobs(client, ["All Sydney NSW"], [], 31, all_sub_ids=[6144, 6145])
+    assert sorted(r["job_id"] for r in result.rows) == ["1", "2", "3", "4", "5"]
+    assert calls[-2:] == ["6144", "6145"] and result.warnings == []
 
 
 class FakeModels:
