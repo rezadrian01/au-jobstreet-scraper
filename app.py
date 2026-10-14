@@ -13,6 +13,7 @@ from streamlit_searchbox import st_searchbox
 
 import ai
 import audit
+import cache
 import glints
 import jobspy_sources
 import scraper
@@ -55,6 +56,18 @@ def log_event(name: str, **fields) -> None:
     audit.event(name, session=session, ip=getattr(st.context, "ip_address", None), **fields)
 
 
+def get_cache() -> cache.Cache | None:
+    """Cache bersama di disk, atau None jika dimatikan di config atau oleh pengguna."""
+    if not (cfg["cache"]["enabled"] and st.session_state.get("use_cache", True)):
+        return None
+    return cache.Cache(scraper.CONFIG_PATH.parent / cfg["cache"]["path"], cfg["cache"]["ttl_days"])
+
+
+def description_batch(site_key: str) -> int:
+    """Lowongan per request deskripsi: Seek/JobStreet bisa digabung, LinkedIn satu per satu."""
+    return cfg["http"]["description_batch_size"] if site_type(site_key) == "seek" else 1
+
+
 def fetch_descriptions(site_key: str, rows: list[dict]) -> None:
     """Ambil deskripsi untuk baris yang belum punya; rows diubah di tempat supaya hasil
     parsial tetap tersimpan kalau proses dihentikan."""
@@ -62,48 +75,71 @@ def fetch_descriptions(site_key: str, rows: list[dict]) -> None:
     if not pending:
         return
     started = time.monotonic()
-    log_event("descriptions_started", site=site_key, requested=pending)
-    bar = st.progress(0.0)
+    store = get_cache()
+    from_cache = store.fill_descriptions(site_key, rows) if store else 0
+    to_fetch = [r for r in rows if r["description"] is None]
+    log_event("descriptions_started", site=site_key, requested=pending, from_cache=from_cache, to_fetch=len(to_fetch))
+    failed = 0
+    if to_fetch:
+        bar = st.progress(0.0)
+        batch = description_batch(site_key)
 
-    def on_progress(i: int, n: int, label: str) -> None:
-        remaining = fmt_minutes(scraper.estimate_detail_seconds(cfg, n - i))
-        bar.progress(i / n if n else 1.0, text=f"Deskripsi {i}/{n} · sisa {remaining} · {label[:60]}")
+        def on_progress(i: int, n: int, label: str) -> None:
+            remaining = fmt_minutes(scraper.estimate_detail_seconds(cfg, n - i, batch))
+            bar.progress(i / n if n else 1.0, text=f"Deskripsi {i}/{n} · sisa {remaining} · {label[:60]}")
 
-    if site_type(site_key) == "linkedin":
-        failed = jobspy_sources.add_descriptions(cfg, sites[site_key], rows, on_progress)
-    else:
-        client = scraper.SeekClient(cfg, site_key)
         try:
-            failed = scraper.add_descriptions(client, rows, on_progress)
+            if site_type(site_key) == "linkedin":
+                failed = jobspy_sources.add_descriptions(cfg, sites[site_key], to_fetch, on_progress)
+            else:
+                client = scraper.SeekClient(cfg, site_key)
+                try:
+                    failed = scraper.add_descriptions(client, to_fetch, on_progress, batch_size=batch)
+                finally:
+                    client.close()
         finally:
-            client.close()
-    bar.empty()
+            # Simpan juga hasil parsial, supaya tarikan yang terputus tidak mengulang dari nol
+            if store:
+                store.store_descriptions(site_key, to_fetch)
+        bar.empty()
     st.session_state.detail_failed = failed
     log_event(
-        "descriptions_finished", site=site_key, requested=pending, failed=failed,
+        "descriptions_finished", site=site_key, requested=pending, from_cache=from_cache, failed=failed,
         still_missing=sum(r["description"] is None for r in rows), seconds=round(time.monotonic() - started),
     )
 
 
-def fetch_requirements(rows: list[dict]) -> None:
+def fetch_requirements(site_key: str, rows: list[dict]) -> None:
     """Ekstrak requirement dan software dengan Gemini untuk baris yang punya deskripsi tetapi belum diproses."""
     requested = len(ai.pending_rows(rows))
     if not requested:
         return
     started = time.monotonic()
-    log_event("ai_started", requested=requested, model=cfg["ai"]["model"])
-    bar = st.progress(0.0, text="Menghubungi Gemini…")
+    store = get_cache()
+    version = ai.ai_version(cfg["ai"])
+    from_cache = store.fill_ai(site_key, rows, version) if store else 0
+    to_analyze = ai.pending_rows(rows)
+    log_event("ai_started", requested=requested, from_cache=from_cache, to_analyze=len(to_analyze), model=cfg["ai"]["model"])
+    failed, error = 0, None
+    if to_analyze:
+        bar = st.progress(0.0, text="Menghubungi Gemini…")
 
-    def on_progress(i: int, n: int, label: str) -> None:
-        bar.progress(i / n if n else 1.0, text=f"Analisis AI {i}/{n} · {label[:60]}")
+        def on_progress(i: int, n: int, label: str) -> None:
+            bar.progress(i / n if n else 1.0, text=f"Analisis AI {i}/{n} · {label[:60]}")
 
-    try:
-        failed, error = ai.add_requirements(ai.make_client(), cfg["ai"], rows, on_progress)
-    except ai.AIError as e:
-        failed, error = len(ai.pending_rows(rows)), str(e)
-    bar.empty()
+        try:
+            failed, error = ai.add_requirements(ai.make_client(), cfg["ai"], to_analyze, on_progress)
+        except ai.AIError as e:
+            failed, error = len(ai.pending_rows(to_analyze)), str(e)
+        finally:
+            if store:
+                store.store_ai(site_key, to_analyze, version)
+        bar.empty()
     st.session_state.ai_error = f"{failed} lowongan gagal dianalisis AI: {error}" if failed else None
-    log_event("ai_finished", requested=requested, failed=failed, error=error, seconds=round(time.monotonic() - started))
+    log_event(
+        "ai_finished", requested=requested, from_cache=from_cache, failed=failed, error=error,
+        seconds=round(time.monotonic() - started),
+    )
 
 
 def site_type(site_key: str) -> str:
@@ -175,7 +211,9 @@ def _run_search(
     else:
         client = scraper.SeekClient(cfg, site_key)
         try:
-            result = scraper.collect_jobs(client, locations, [sub_map[n] for n in sub_names], daterange, on_progress)
+            result = scraper.collect_jobs(
+                client, locations, [sub_map[n] for n in sub_names], daterange, on_progress, all_sub_ids=list(sub_map.values())
+            )
         finally:
             client.close()
     bar.empty()
@@ -200,7 +238,7 @@ def _run_search(
         if site_type(site_key) in DESCRIPTION_FETCHERS:  # Indeed dan Glints sudah termasuk deskripsi
             fetch_descriptions(site_key, candidates)
         if with_requirements:
-            fetch_requirements(candidates)
+            fetch_requirements(site_key, candidates)
 
 
 def candidate_rows(rows: list[dict], keywords: list[str], title_only: bool) -> list[dict]:
@@ -334,6 +372,15 @@ with st.sidebar:
             help="Pencarian berhenti setelah jumlah ini. Hasil diurutkan dari yang paling relevan, dan situsnya "
             "sendiri berhenti di sekitar 1.000.",
         )
+    if cfg["cache"]["enabled"]:
+        st.checkbox(
+            "Pakai cache",
+            value=True,
+            key="use_cache",
+            help=f"Deskripsi dan hasil AI lowongan yang pernah ditarik dalam {cfg['cache']['ttl_days']} hari terakhir "
+            "dipakai ulang, jadi tarikan ulang jauh lebih cepat dan hemat biaya AI. Daftar lowongan selalu diambil "
+            "langsung dari situs. Matikan untuk mengambil ulang semuanya.",
+        )
     start = st.button("Tarik data", type="primary", width="stretch", disabled=keyword_site and not keywords)
 
 # ---------- Halaman utama ----------
@@ -369,7 +416,7 @@ pending = sum(r["description"] is None for r in candidates)
 if pending:
     failed = st.session_state.get("detail_failed", 0)
     note = f"{failed} deskripsi gagal diambil. " if failed else ""
-    estimate = fmt_minutes(scraper.estimate_detail_seconds(cfg, pending))
+    estimate = fmt_minutes(scraper.estimate_detail_seconds(cfg, pending, description_batch(search["site_key"])))
     st.warning(f"{note}{pending} dari {len(candidates)} lowongan belum punya deskripsi.")
     if result_type in DESCRIPTION_FETCHERS and st.button(f"Ambil deskripsi {pending} lowongan ({estimate})"):
         fetch_descriptions(search["site_key"], candidates)
@@ -381,7 +428,7 @@ if st.session_state.get("ai_error"):
     st.error(st.session_state.ai_error)
 ai_pending = len(ai.pending_rows(shown))
 if ai_pending and st.button(f"Analisis {ai_pending} lowongan dengan AI (requirement dan software)"):
-    fetch_requirements(shown)
+    fetch_requirements(search["site_key"], shown)
     st.rerun()
 
 col_total, col_shown, col_desc, col_req = st.columns(4)

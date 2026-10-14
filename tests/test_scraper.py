@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import ai
+import cache
 import glints
 import jobspy_sources
 import scraper
@@ -165,26 +167,97 @@ def test_collect_jobs_dedupes_across_locations_and_reports_failures():
     assert [r["search_location"] for r in result.rows] == ["A", "A", "B"]
     assert result.failed_locations == 1
     assert len(result.messages) == 2 and len(result.warnings) == 1
+    assert "GAGAL" in result.warnings[0]
 
 
-def test_add_descriptions_via_graphql():
+def graphql_handler(missing=(), fail=False):
+    """Tiruan GraphQL Seek: satu alias per lowongan, `missing` dikembalikan null."""
+    seen = []
+
     def handler(request):
-        job_id = json.loads(request.content)["variables"]["id"]
-        if job_id == "2":
-            return httpx.Response(200, json={"data": {"jobDetails": None}, "errors": [{"message": "Not found"}]})
-        return httpx.Response(200, json={"data": {"jobDetails": {"job": {"id": job_id, "content": "<p>Uses Xero</p>"}}}})
+        query = json.loads(request.content)["query"]
+        pairs = re.findall(r'(j\d+): jobDetails\(id: "(\d+)"\)', query)
+        seen.append([job_id for _, job_id in pairs])
+        if fail:
+            return httpx.Response(500)
+        data = {alias: (None if job_id in missing else {"job": {"id": job_id, "content": f"<p>Isi {job_id}</p>"}})
+                for alias, job_id in pairs}
+        return httpx.Response(200, json={"data": data})
+
+    return handler, seen
+
+
+def test_add_descriptions_in_batches():
+    handler, seen = graphql_handler(missing={"2"})
+    client, stats = make_client(handler)
+    rows = [scraper.new_row(job_id=str(i), title=f"t{i}") for i in range(1, 6)]
+    rows[4]["description"] = "already"
+    progress = []
+    failed = scraper.add_descriptions(client, rows, lambda i, n, label: progress.append((i, n)), batch_size=2)
+    assert failed == 1
+    assert [r["description"] for r in rows] == ["Isi 1", None, "Isi 3", "Isi 4", "already"]
+    assert seen == [["1", "2"], ["3", "4"]] and stats.requests == 2
+    assert progress == [(0, 4), (2, 4), (4, 4)]
+
+
+def test_add_descriptions_batch_failure_counts_whole_batch():
+    handler, _ = graphql_handler(fail=True)
+    client, _ = make_client(handler, max_retries=0)
+    rows = [scraper.new_row(job_id=str(i), title="t") for i in range(1, 4)]
+    assert scraper.add_descriptions(client, rows, batch_size=20) == 3
+    assert all(r["description"] is None for r in rows)
+
+
+def test_fetch_descriptions_skips_non_numeric_ids():
+    handler, seen = graphql_handler()
+    client, _ = make_client(handler)
+    assert client.fetch_descriptions(["7", 'x") { evil'])  == {"7": "Isi 7", 'x") { evil': None}
+    assert seen == [["7"]]
+
+
+def test_search_reports_truncation_when_site_stops_at_cap():
+    # Situs berhenti memberi hasil setelah batas dan melaporkan totalCount 0 di halaman kosong
+    def handler(request):
+        page = int(request.url.params["page"])
+        if page <= 2:
+            return httpx.Response(200, json={"totalCount": 9, "data": [{"id": f"{page}-{k}"} for k in range(2)]})
+        return httpx.Response(200, json={"totalCount": 0, "data": []})
 
     client, _ = make_client(handler)
-    rows = [
-        {"job_id": "1", "title": "a", "description": None},
-        {"job_id": "2", "title": "b", "description": None},
-        {"job_id": "3", "title": "c", "description": "already"},
-    ]
-    progress = []
-    failed = scraper.add_descriptions(client, rows, lambda i, n, label: progress.append((i, n)))
-    assert failed == 1
-    assert [r["description"] for r in rows] == ["Uses Xero", None, "already"]
-    assert progress == [(0, 2), (1, 2), (2, 2)]
+    jobs, received, total, truncated = client.search("All Sydney NSW", [], 31)
+    assert (len(jobs), received, total, truncated) == (4, 4, 9, True)
+
+
+def test_collect_jobs_splits_by_subclassification_above_cap(monkeypatch):
+    monkeypatch.setattr(scraper, "SEEK_RESULT_CAP", 3)
+    calls = []
+
+    def handler(request):
+        params = request.url.params
+        calls.append((params.get("subclassification"), params["pageSize"]))
+        if params["pageSize"] == "1":
+            return httpx.Response(200, json={"totalCount": 5, "data": []})
+        ids = {"6144": ["1", "2"], "6145": ["2", "3", "4"]}[params["subclassification"]]
+        return httpx.Response(200, json={"totalCount": len(ids), "data": [{**RAW_JOB, "id": i} for i in ids]})
+
+    client, _ = make_client(handler, page_size=100)
+    result = scraper.collect_jobs(client, ["All Sydney NSW"], [], 31, all_sub_ids=[6144, 6145])
+    assert [r["job_id"] for r in result.rows] == ["1", "2", "3", "4"]
+    assert calls[0] == (None, "1")  # hitung dulu, lalu pecah
+    assert [c[0] for c in calls[1:]] == ["6144", "6145"]
+    assert "dipecah jadi 2 pencarian" in result.messages[0] and result.warnings == []
+
+
+def test_collect_jobs_single_search_below_cap():
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.params["pageSize"])
+        return httpx.Response(200, json={"totalCount": 2, "data": [] if request.url.params["pageSize"] == "1" else [{**RAW_JOB, "id": i} for i in ("1", "2")]})
+
+    client, _ = make_client(handler, page_size=100)
+    result = scraper.collect_jobs(client, ["All Sydney NSW"], [6145], 7, all_sub_ids=[6144, 6145])
+    assert calls == ["1", "100"] and len(result.rows) == 2
 
 
 class FakeModels:
@@ -567,3 +640,67 @@ def test_audit_event_writes_one_searchable_line(capsys):
     assert "jobscraper.audit pull_started {" in lines[0]
     payload = json.loads(lines[0].split("pull_started ", 1)[1])
     assert payload == {"site": "jobstreet_id", "locations": ["Jakarta Raya"], "pull_id": "abc123"}
+
+
+def test_token_rate_limiter_waits_when_window_is_full():
+    now = [0.0]
+    slept = []
+
+    def sleep(seconds):
+        slept.append(seconds)
+        now[0] += seconds
+
+    limiter = ai.TokenRateLimiter(1000, clock=lambda: now[0], sleep=sleep)
+    first = limiter.acquire(600)
+    limiter.settle(first, 700)
+    now[0] = 10
+    limiter.acquire(200)          # 700 + 200 <= 1000: langsung
+    assert slept == []
+    limiter.acquire(300)          # 900 + 300 > 1000: tunggu sampai panggilan pertama keluar dari jendela
+    assert slept and now[0] >= 60
+
+
+def test_extract_requirements_passes_thinking_budget():
+    seen = {}
+
+    class Models:
+        def generate_content(self, model, contents, config):
+            seen["thinking"] = config.thinking_config
+            return type("R", (), {"text": '{"requirements": [], "software": []}', "usage_metadata": None})()
+
+    client = type("C", (), {"models": Models()})()
+    ai.extract_requirements(client, {**AI_CFG, "thinking_budget": 0}, "t", "d")
+    assert seen["thinking"].thinking_budget == 0
+    ai.extract_requirements(client, AI_CFG, "t", "d")
+    assert seen["thinking"] is None
+
+
+def test_ai_version_changes_with_settings():
+    assert ai.ai_version(AI_CFG) == ai.ai_version(dict(AI_CFG))
+    assert ai.ai_version(AI_CFG) != ai.ai_version({**AI_CFG, "model": "other"})
+    assert ai.ai_version(AI_CFG) != ai.ai_version({**AI_CFG, "thinking_budget": 0})
+
+
+def test_cache_descriptions_and_ai_roundtrip(tmp_path):
+    now = [1000.0]
+    store = cache.Cache(tmp_path / "c.sqlite", ttl_days=1, clock=lambda: now[0])
+    fetched = [scraper.new_row(job_id="1", description="Isi", work_type="Full-time", apply_type="Easy Apply"),
+               scraper.new_row(job_id="2")]
+    store.store_descriptions("linkedin_id", fetched)
+    fetched[0]["requirements"], fetched[0]["software"] = "- CPA", "SAP"
+    store.store_ai("linkedin_id", fetched, "v1")
+
+    rows = [scraper.new_row(job_id="1"), scraper.new_row(job_id="2"), scraper.new_row(job_id="3")]
+    assert store.fill_descriptions("linkedin_id", rows) == 1
+    assert (rows[0]["description"], rows[0]["work_type"], rows[0]["apply_type"]) == ("Isi", "Full-time", "Easy Apply")
+    assert rows[1]["description"] is None
+    assert store.fill_ai("linkedin_id", rows, "v2") == 0          # versi AI berbeda: tidak dipakai
+    assert store.fill_ai("linkedin_id", rows, "v1") == 1
+    assert (rows[0]["requirements"], rows[0]["software"]) == ("- CPA", "SAP")
+
+    other_site = [scraper.new_row(job_id="1")]
+    assert store.fill_descriptions("jobstreet_id", other_site) == 0
+
+    now[0] += 2 * 86400                                            # kedaluwarsa
+    stale = [scraper.new_row(job_id="1")]
+    assert store.fill_descriptions("linkedin_id", stale) == 0

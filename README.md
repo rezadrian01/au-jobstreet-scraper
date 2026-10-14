@@ -87,10 +87,16 @@ Browser akan terbuka di `http://localhost:8501`.
 
 - **Tidak bisa backdate.** Kedua situs hanya menampilkan lowongan aktif, sekitar 30 hari ke belakang.
   Karena tidak ada database, lowongan yang sudah hilang dari situs tidak bisa diambil lagi.
-- **Deskripsi butuh 1 request per lowongan** dengan jeda 1,5-3 detik. Kira-kira 2,5 menit per 60 lowongan.
-  Kriteria yang lebar (mis. semua Accounting di Jakarta, hampir 2.000 lowongan) bisa lebih dari satu jam.
-  Hilangkan centang **Ambil deskripsi lowongan** untuk melihat jumlahnya dulu, lalu ambil deskripsinya dengan
-  tombol yang muncul di halaman hasil.
+- **Kecepatan.** Seek/JobStreet mengambil deskripsi 20 lowongan per request (`description_batch_size`),
+  sekitar 3 detik per 20 lowongan. LinkedIn tetap satu lowongan per request. Analisis AI berjalan 20 panggilan
+  paralel tanpa mode "berpikir", dibatasi 2 juta token per menit (`tpm_limit`, batas Standard PayGo Tier 1).
+- **Batas 500 hasil per pencarian.** Seek dan JobStreet berhenti memberi hasil setelah 500 lowongan per
+  pencarian. Kalau satu lokasi melebihi itu, aplikasi otomatis memecah pencarian per subklasifikasi; kalau satu
+  subklasifikasi masih melebihi 500, muncul peringatan.
+- **Cache.** Deskripsi dan hasil AI disimpan per lowongan di `data/cache.sqlite` selama 30 hari, jadi tarikan
+  ulang hanya memproses lowongan baru. Daftar lowongan tetap selalu diambil langsung dari situs. Hilangkan
+  centang **Pakai cache** untuk mengambil ulang semuanya; hasil AI lama otomatis diabaikan kalau model atau
+  instruksinya berubah.
 - **Tidak ada filter software.** Kolom Software diisi AI dari isi lowongan. Hanya software yang disebut
   namanya yang tercatat ("accounting software" tanpa nama tidak dihitung), dan AI menulis nama produk
   resminya (mis. "Ms. Excel" menjadi "Microsoft Excel").

@@ -13,10 +13,11 @@ user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Ge
 timeout = 30
 delay_min = 2.0            # jeda antar request pencarian (detik), dengan jitter acak
 delay_max = 5.0
-detail_delay_min = 1.5     # jeda antar request deskripsi (1 request per lowongan)
+detail_delay_min = 1.5     # jeda antar request deskripsi
 detail_delay_max = 3.0
 max_retries = 4            # retry saat 403/429/5xx/error jaringan
 backoff_base = 5.0         # detik; dikali 2 tiap retry
+description_batch_size = 20  # Seek/JobStreet: deskripsi sekian lowongan per request (diuji sampai 40)
 
 # Lokasi memakai nilai `where` situs. Di Seek, "All <kota>" = seluruh wilayah kota;
 # "Sydney NSW" saja ditafsirkan sebagai suburb Sydney 2000 + radius 50 km.
@@ -144,6 +145,15 @@ subclassifications = ["Audit - External", "Audit - Internal"]
 # Project, region, dan kredensial GCP diatur di file .env (lihat .env.example).
 [ai]
 model = "gemini-3.8-flash" # alternatif lebih murah dan cepat: "gemini-3.5-flash-lite"
-concurrency = 5            # jumlah panggilan paralel ke Gemini
-max_retries = 3
+concurrency = 20           # jumlah panggilan paralel ke Gemini
+max_retries = 5            # coba ulang saat 429 / 5xx / batas waktu, dengan jeda yang makin lama
 backoff_base = 2.0
+thinking_budget = 0        # 0 = tanpa mode "berpikir": 2x lebih cepat dan lebih murah, hasil sebanding
+tpm_limit = 2000000        # batas token per menit yang dipakai aplikasi (Standard PayGo Tier 1, Gemini Flash)
+
+# Cache deskripsi dan hasil AI per lowongan, supaya tarikan ulang hanya memproses lowongan baru.
+# Hasil pencarian selalu diambil langsung dari situs; yang dipakai ulang hanya isi lowongan dan hasil AI.
+[cache]
+enabled = true
+path = "data/cache.sqlite"   # relatif terhadap folder aplikasi
+ttl_days = 30

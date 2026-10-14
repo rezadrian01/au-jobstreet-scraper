@@ -191,6 +191,26 @@ gratis pengganti Glints:
   deskripsi lowongan external rata-rata lebih panjang (3.450 vs 1.300 karakter).
 - **Pemakaian token nyata** per lowongan (6 sampel): sekitar 550 input, 130 output, 330 token "thinking".
 
+## Optimasi kecepatan (14 Oktober 2026)
+
+Dari log audit, tarikan 1.486 lowongan (Seek, 3 kota, 25 subklasifikasi, 31 hari) makan 107 menit:
+deskripsi 63 menit (1 request per lowongan), AI 43 menit (5 paralel, dengan mode "berpikir").
+
+- **Bug data terpotong:** Seek/JobStreet berhenti memberi hasil setelah 500 lowongan per pencarian dan
+  melaporkan `totalCount` 0 di halaman setelahnya, sehingga aplikasi tidak memberi peringatan. Sydney saja
+  punya 1.710 lowongan untuk kriteria itu. Sekarang aplikasi menghitung dulu (`pageSize=1`) dan memecah per
+  subklasifikasi bila lebih dari 500.
+- **Deskripsi gabungan:** GraphQL menerima banyak alias `jobDetails` dalam satu query; diuji 1/10/20/40
+  lowongan per request, semuanya berhasil dalam sekitar 0,5 detik. Dipakai 20 per request.
+- **AI tanpa berpikir:** `thinking_budget=0` menurunkan waktu per lowongan dari 4,7 ke 2,4 detik dengan jumlah
+  poin sebanding; `gemini-3.5-flash-lite` lebih cepat tetapi melewatkan banyak poin, jadi tidak dipakai.
+- **Kuota Gemini:** Standard PayGo memakai tier berdasarkan belanja 30 hari (Tier 1: 2 juta token per menit untuk
+  Flash), tanpa formulir kenaikan; 429 berarti kapasitas bersama sedang padat, bukan kuota tetap. Aplikasi
+  memakai 20 panggilan paralel dengan pembatas token per menit sebesar Tier 1 (`tpm_limit`).
+- **Cache** (`cache.py`, SQLite di `data/cache.sqlite`, 30 hari): deskripsi, data pelengkap LinkedIn, dan hasil AI
+  per lowongan. Hasil AI hanya dipakai ulang jika `ai_version` (model + instruksi + pengaturan) sama.
+- Uji lokal JobStreet 36 lowongan: deskripsi 3 detik, AI 8 detik; tarikan kedua 4 detik total dari cache.
+
 ## Yang belum terverifikasi
 
 - Batas maksimum `pageSize` dan batas jumlah halaman.

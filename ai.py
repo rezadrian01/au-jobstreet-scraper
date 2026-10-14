@@ -5,8 +5,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import hashlib
+import random
 import subprocess
+import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
@@ -147,22 +151,74 @@ def format_software(items: list[str]) -> str:
     return ", ".join(names)
 
 
-def extract_requirements(client, ai_cfg: dict, title: str | None, description: str, sleep=time.sleep) -> dict:
+def ai_version(ai_cfg: dict) -> str:
+    """Penanda model + instruksi + pengaturan; hasil AI di cache hanya dipakai ulang jika penandanya sama."""
+    raw = json.dumps([ai_cfg["model"], ai_cfg.get("thinking_budget"), SYSTEM_INSTRUCTION, RESPONSE_SCHEMA], sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+class TokenRateLimiter:
+    """Batasi token per menit di semua thread: tunggu sebelum memanggil jika jendela 60 detik terakhir sudah penuh."""
+
+    def __init__(self, tokens_per_minute: int, clock=time.monotonic, sleep=time.sleep):
+        self.limit = tokens_per_minute
+        self.clock = clock
+        self.sleep = sleep
+        self.window: deque[list] = deque()  # [waktu, token]
+        self.lock = threading.Lock()
+
+    def _used(self, now: float) -> int:
+        while self.window and now - self.window[0][0] >= 60:
+            self.window.popleft()
+        return sum(entry[1] for entry in self.window)
+
+    def acquire(self, estimate: int) -> list:
+        while True:
+            with self.lock:
+                now = self.clock()
+                if self._used(now) + estimate <= self.limit or not self.window:
+                    entry = [now, estimate]
+                    self.window.append(entry)
+                    return entry
+                wait = 60 - (now - self.window[0][0])
+            self.sleep(max(wait, 0.05))
+
+    def settle(self, entry: list, actual: int | None) -> None:
+        """Ganti perkiraan dengan jumlah token sebenarnya setelah panggilan selesai."""
+        if actual is not None:
+            with self.lock:
+                entry[1] = actual
+
+
+def estimate_tokens(prompt: str) -> int:
+    # Kasar: sekitar 4 karakter per token, ditambah instruksi sistem dan jawaban
+    return len(prompt) // 4 + len(SYSTEM_INSTRUCTION) // 4 + 600
+
+
+def extract_requirements(
+    client, ai_cfg: dict, title: str | None, description: str, sleep=time.sleep, limiter: TokenRateLimiter | None = None
+) -> dict:
     """Kembalikan {"requirements": [...], "software": [...]} dari satu deskripsi lowongan."""
     from google.genai import errors, types
 
-    config = types.GenerateContentConfig(
+    options = dict(
         system_instruction=SYSTEM_INSTRUCTION,
         response_mime_type="application/json",
         response_schema=RESPONSE_SCHEMA,
         temperature=0,
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
+    if ai_cfg.get("thinking_budget") is not None:
+        options["thinking_config"] = types.ThinkingConfig(thinking_budget=ai_cfg["thinking_budget"])
+    config = types.GenerateContentConfig(**options)
     prompt = f"Job title: {title or '-'}\n\nJob advertisement:\n{description}"
     retries = ai_cfg["max_retries"]
     for attempt in range(retries + 1):
         try:
+            entry = limiter.acquire(estimate_tokens(prompt)) if limiter else None
             resp = client.models.generate_content(model=ai_cfg["model"], contents=prompt, config=config)
+            if limiter:
+                limiter.settle(entry, getattr(getattr(resp, "usage_metadata", None), "total_token_count", None))
             data = json.loads(resp.text or "")
             return {
                 "requirements": [str(item) for item in data["requirements"]],
@@ -182,7 +238,8 @@ def extract_requirements(client, ai_cfg: dict, title: str | None, description: s
             if attempt == retries:
                 raise AIError(f"Jawaban Gemini tidak bisa dibaca ({type(e).__name__})") from e
             reason = "jawaban tidak valid"
-        wait = ai_cfg["backoff_base"] * 2**attempt
+        # Jitter supaya 20 thread yang kena 429 bersamaan tidak mencoba ulang di detik yang sama
+        wait = ai_cfg["backoff_base"] * 2**attempt * random.uniform(0.75, 1.5)
         log.warning("Gemini gagal (%s), retry %d/%d dalam %.0f detik", reason, attempt + 1, retries, wait)
         sleep(wait)
     raise AIError("unreachable")
@@ -207,9 +264,10 @@ def add_requirements(
     last_error = None
     if on_progress:
         on_progress(0, len(pending), "")
+    limiter = TokenRateLimiter(ai_cfg["tpm_limit"]) if ai_cfg.get("tpm_limit") else None
     with ThreadPoolExecutor(max_workers=ai_cfg["concurrency"]) as pool:
         futures = {
-            pool.submit(extract_requirements, client, ai_cfg, row["title"], row["description"]): row
+            pool.submit(extract_requirements, client, ai_cfg, row["title"], row["description"], limiter=limiter): row
             for row in pending
         }
         for done, future in enumerate(as_completed(futures), start=1):

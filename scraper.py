@@ -27,6 +27,8 @@ RETRY_STATUSES = {403, 429, 500, 502, 503, 504}
 CONFIG_PATH = Path(__file__).with_name("config.toml")
 
 JOB_DETAILS_QUERY = "query jobDetails($id: ID!) { jobDetails(id: $id) { job { id content } } }"
+# Seek/JobStreet berhenti memberi hasil setelah 500 lowongan per pencarian, berapa pun totalCount-nya
+SEEK_RESULT_CAP = 500
 
 FIELDS = [
     "job_id",
@@ -262,14 +264,33 @@ class SeekClient:
         received = 0
         for page in range(1, self.search_cfg["max_pages"] + 1):
             data = self._request("GET", SEARCH_PATH, delay, params={**params, "page": page})
-            total = data.get("totalCount") or 0
+            # Halaman setelah batas 500 melaporkan totalCount 0, jadi simpan angka terbesar yang pernah terlihat
+            total = max(total, data.get("totalCount") or 0)
             batch = data.get("data") or []
             received += len(batch)
             for raw in batch:
                 jobs.setdefault(str(raw["id"]), raw)
             if not batch or received >= total:
-                return list(jobs.values()), received, total, False
+                return list(jobs.values()), received, total, received < total
         return list(jobs.values()), received, total, True
+
+    def count(self, where: str, sub_ids: list[int], daterange: int) -> int:
+        """Jumlah lowongan yang dilaporkan situs untuk satu pencarian (1 request kecil)."""
+        params = {
+            "siteKey": self.site["site_key"],
+            "locale": self.site["locale"],
+            "classification": self.search_cfg["classification"],
+            "pageSize": 1,
+            "page": 1,
+        }
+        if where:
+            params["where"] = where
+        if sub_ids:
+            params["subclassification"] = ",".join(str(s) for s in sub_ids)
+        if daterange > 0:
+            params["daterange"] = daterange
+        data = self._request("GET", SEARCH_PATH, (self.http["delay_min"], self.http["delay_max"]), params=params)
+        return data.get("totalCount") or 0
 
     def fetch_description(self, job_id: str) -> str:
         """Ambil isi lengkap lowongan (teks polos) lewat GraphQL."""
@@ -283,6 +304,26 @@ class SeekClient:
             raise FetchError(errors[0].get("message", "tanpa data") if errors else "tanpa data")
         return html_to_text(job.get("content"))
 
+    def fetch_descriptions(self, job_ids: list[str]) -> dict[str, str | None]:
+        """Ambil isi beberapa lowongan sekaligus dalam satu request GraphQL (alias per lowongan).
+
+        Mengembalikan {job_id: teks} dengan None untuk lowongan yang tidak dikembalikan situs.
+        """
+        delay = (self.http["detail_delay_min"], self.http["detail_delay_max"])
+        texts: dict[str, str | None] = {str(job_id): None for job_id in job_ids}
+        # ID Seek selalu berupa angka; selain itu tidak dimasukkan ke query
+        aliases = {f"j{n}": job_id for n, job_id in enumerate(texts) if job_id.isdigit()}
+        if not aliases:
+            return texts
+        fields = " ".join(f'{alias}: jobDetails(id: "{job_id}") {{ job {{ id content }} }}' for alias, job_id in aliases.items())
+        data = self._request("POST", GRAPHQL_PATH, delay, json={"query": f"query {{ {fields} }}"})
+        results = data.get("data") or {}
+        for alias, job_id in aliases.items():
+            job = (results.get(alias) or {}).get("job")
+            if job:
+                texts[job_id] = html_to_text(job.get("content"))
+        return texts
+
 
 def collect_jobs(
     client: SeekClient,
@@ -290,19 +331,43 @@ def collect_jobs(
     sub_ids: list[int],
     daterange: int,
     on_progress: Callable[[int, int, str], None] | None = None,
+    all_sub_ids: list[int] | None = None,
 ) -> SearchResult:
-    """Jalankan pencarian untuk tiap lokasi dan gabungkan hasilnya tanpa duplikat."""
+    """Jalankan pencarian untuk tiap lokasi dan gabungkan hasilnya tanpa duplikat.
+
+    Situs hanya memberi 500 hasil per pencarian. Kalau satu lokasi melebihi itu, pencariannya dipecah per
+    subklasifikasi (yang dipilih, atau semua `all_sub_ids` jika tidak ada yang dipilih) supaya tidak terpotong.
+    """
     scraped_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     classification = client.search_cfg["classification"]
     result = SearchResult()
     seen: set[str] = set()
     targets = locations or [""]
+    split_ids = list(sub_ids or all_sub_ids or [])
     for i, where in enumerate(targets):
         label = where or client.site.get("all_locations_label", "Semua lokasi")
         if on_progress:
             on_progress(i, len(targets), label)
         try:
-            raw_jobs, received, total, truncated = client.search(where, sub_ids, daterange)
+            total = client.count(where, sub_ids, daterange)
+            if total > SEEK_RESULT_CAP and len(split_ids) > 1:
+                searches = [[s] for s in split_ids]
+            else:
+                searches = [sub_ids]
+            raw_jobs: list[dict] = []
+            received = 0
+            for part in searches:
+                if on_progress and len(searches) > 1:
+                    on_progress(i, len(targets), f"{label} · dipecah per subklasifikasi ({len(raw_jobs)} lowongan)")
+                jobs, got, part_total, truncated = client.search(where, part, daterange)
+                raw_jobs.extend(jobs)
+                received += got
+                if truncated:
+                    name = f" subklasifikasi {part[0]}" if len(searches) > 1 else ""
+                    result.warnings.append(
+                        f"{label}{name}: hanya dapat {got} dari {part_total} lowongan (situs membatasi "
+                        f"{SEEK_RESULT_CAP} per pencarian). Persempit lokasi atau rentang hari."
+                    )
         except FetchError as e:
             result.failed_locations += 1
             result.warnings.append(f"{label}: GAGAL ({e})")
@@ -314,15 +379,13 @@ def collect_jobs(
                 seen.add(row["job_id"])
                 result.rows.append(row)
                 new += 1
-        dupes = received - len(raw_jobs)
-        result.messages.append(f"{label}: {new} job" + (f" (+{dupes} duplikat promoted dibuang)" if dupes else ""))
-        if truncated:
-            result.warnings.append(
-                f"{label}: batas max_pages={client.search_cfg['max_pages']} tercapai, data kemungkinan "
-                f"TERPOTONG ({received} dari {total}). Perpendek rentang hari atau persempit subklasifikasi."
-            )
-        elif received < total:
-            result.warnings.append(f"{label}: hanya dapat {received} dari {total} item yang dilaporkan API")
+        notes = []
+        if len(searches) > 1:
+            notes.append(f"dipecah jadi {len(searches)} pencarian karena lebih dari {SEEK_RESULT_CAP}")
+        dupes = received - len({str(r["id"]) for r in raw_jobs})
+        if dupes:
+            notes.append(f"+{dupes} duplikat dibuang")
+        result.messages.append(f"{label}: {new} job" + (f" ({'; '.join(notes)})" if notes else ""))
     if on_progress:
         on_progress(len(targets), len(targets), "")
     return result
@@ -332,18 +395,31 @@ def add_descriptions(
     client: SeekClient,
     rows: list[dict],
     on_progress: Callable[[int, int, str], None] | None = None,
+    batch_size: int = 20,
 ) -> int:
-    """Isi kolom description untuk baris yang belum punya. Mengembalikan jumlah yang gagal."""
+    """Isi kolom description untuk baris yang belum punya, `batch_size` lowongan per request.
+
+    Mengembalikan jumlah yang gagal.
+    """
     pending = [r for r in rows if r["description"] is None]
     failed = 0
-    for i, row in enumerate(pending):
+    for start in range(0, len(pending), batch_size):
+        chunk = pending[start : start + batch_size]
         if on_progress:
-            on_progress(i, len(pending), row["title"] or row["job_id"])
+            on_progress(start, len(pending), chunk[0]["title"] or chunk[0]["job_id"])
         try:
-            row["description"] = client.fetch_description(row["job_id"])
+            texts = client.fetch_descriptions([r["job_id"] for r in chunk])
         except FetchError as e:
-            failed += 1
-            log.warning("Deskripsi job %s gagal diambil (%s)", row["job_id"], e)
+            failed += len(chunk)
+            log.warning("Deskripsi %d job gagal diambil (%s): %s", len(chunk), e, ", ".join(r["job_id"] for r in chunk))
+            continue
+        for row in chunk:
+            text = texts.get(row["job_id"])
+            if text is None:
+                failed += 1
+                log.warning("Deskripsi job %s tidak dikembalikan situs", row["job_id"])
+            else:
+                row["description"] = text
     if on_progress:
         on_progress(len(pending), len(pending), "")
     return failed
@@ -360,9 +436,11 @@ def filter_title(rows: list[dict], keywords: list[str]) -> list[dict]:
     return [r for r in rows if any(k in (r["title"] or "").lower() for k in wanted)]
 
 
-def estimate_detail_seconds(cfg: dict, count: int) -> float:
+def estimate_detail_seconds(cfg: dict, count: int, batch_size: int = 1) -> float:
+    """Perkiraan lama mengambil deskripsi; `batch_size` lowongan per request."""
     http = cfg["http"]
-    return count * ((http["detail_delay_min"] + http["detail_delay_max"]) / 2 + 0.5)
+    requests = -(-count // max(batch_size, 1))
+    return requests * ((http["detail_delay_min"] + http["detail_delay_max"]) / 2 + 0.6)
 
 
 def write_csv(rows: list[dict], path: Path) -> None:
@@ -420,7 +498,7 @@ def main(argv: list[str] | None = None) -> int:
             cfg["sites"][args.site]["name"], locations, names or "semua Accounting",
             f"{daterange} hari" if daterange > 0 else "tanpa filter",
         )
-        result = collect_jobs(client, locations, sub_ids, daterange)
+        result = collect_jobs(client, locations, sub_ids, daterange, all_sub_ids=list(sub_map.values()))
         for msg in result.messages:
             log.info(msg)
         for warning in result.warnings:
@@ -428,9 +506,10 @@ def main(argv: list[str] | None = None) -> int:
         rows = result.rows
         failed_details = 0
         if rows and not args.no_description:
-            log.info("Mengambil deskripsi %d job (perkiraan %.0f menit)", len(rows), estimate_detail_seconds(cfg, len(rows)) / 60)
+            batch = cfg["http"]["description_batch_size"]
+            log.info("Mengambil deskripsi %d job (perkiraan %.0f menit)", len(rows), estimate_detail_seconds(cfg, len(rows), batch) / 60)
             failed_details = add_descriptions(
-                client, rows, lambda i, n, _: log.info("Deskripsi %d/%d", i, n) if i and i % 25 == 0 else None
+                client, rows, lambda i, n, _: log.info("Deskripsi %d/%d", i, n) if i else None, batch_size=batch
             )
         failed_ai = 0
         if args.requirements and rows:
