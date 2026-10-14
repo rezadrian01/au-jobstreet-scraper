@@ -96,7 +96,8 @@ Browser akan terbuka di `http://localhost:8501`.
 - **Cache.** Deskripsi dan hasil AI disimpan per lowongan di `data/cache.sqlite` selama 30 hari, jadi tarikan
   ulang hanya memproses lowongan baru. Daftar lowongan tetap selalu diambil langsung dari situs. Hilangkan
   centang **Pakai cache** untuk mengambil ulang semuanya; hasil AI lama otomatis diabaikan kalau model atau
-  instruksinya berubah.
+  instruksinya berubah. Entri yang deskripsi dan hasil AI-nya sudah lebih dari 30 hari dihapus otomatis,
+  paling sering sekali sehari, setelah sebuah tarikan selesai (tercatat di log audit sebagai `cache_purged`).
 - **Tidak ada filter software.** Kolom Software diisi AI dari isi lowongan. Hanya software yang disebut
   namanya yang tercatat ("accounting software" tanpa nama tidak dihitung), dan AI menulis nama produk
   resminya (mis. "Ms. Excel" menjadi "Microsoft Excel").

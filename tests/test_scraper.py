@@ -727,3 +727,32 @@ def test_cache_descriptions_and_ai_roundtrip(tmp_path):
     now[0] += 2 * 86400                                            # kedaluwarsa
     stale = [scraper.new_row(job_id="1")]
     assert store.fill_descriptions("linkedin_id", stale) == 0
+
+
+def test_cache_purge_removes_only_expired_entries_once_per_day(tmp_path):
+    now = [0.0]
+    store = cache.Cache(tmp_path / "c.sqlite", ttl_days=30, clock=lambda: now[0])
+    store.store_descriptions("seek_au", [scraper.new_row(job_id="old", description="lama")])
+    now[0] = 20 * 86400
+    store.store_descriptions("seek_au", [scraper.new_row(job_id="fresh", description="baru")])
+    store.store_ai("seek_au", [{**scraper.new_row(job_id="old"), "requirements": "- r"}], "v1")  # AI diperbarui hari ke-20
+    now[0] = 45 * 86400
+    # "old": deskripsinya sudah 45 hari, tetapi hasil AI-nya baru 25 hari, jadi entrinya masih disimpan
+    assert store.purge() == 0
+    assert store.stats()["jobs"] == 2
+    assert store.purge() is None                      # baru saja dibersihkan: dilewati
+    now[0] = 52 * 86400                               # semua entri sudah lebih dari 30 hari
+    assert store.purge() == 2
+    assert store.stats()["jobs"] == 0
+    assert store.purge(force=True) == 0
+
+
+def test_cache_purge_vacuums_after_large_delete(tmp_path, monkeypatch):
+    monkeypatch.setattr(cache, "VACUUM_MIN_DELETED", 1)
+    now = [0.0]
+    store = cache.Cache(tmp_path / "c.sqlite", ttl_days=1, clock=lambda: now[0])
+    store.store_descriptions("seek_au", [scraper.new_row(job_id=str(i), description="x" * 5000) for i in range(300)])
+    size_before = store.stats()["bytes"]
+    now[0] = 2 * 86400
+    assert store.purge() == 300
+    assert store.stats()["bytes"] < size_before

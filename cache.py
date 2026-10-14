@@ -26,8 +26,15 @@ CREATE TABLE IF NOT EXISTS jobs (
     ai_version TEXT,
     ai_at REAL,
     PRIMARY KEY (site, job_id)
-)
+);
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
 """
+
+PURGE_INTERVAL = 86400   # bersihkan paling sering sekali sehari
+VACUUM_MIN_DELETED = 500  # rapikan file (VACUUM) hanya kalau yang terhapus cukup banyak
 
 
 class Cache:
@@ -37,7 +44,7 @@ class Cache:
         self.clock = clock
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
-            db.execute(SCHEMA)
+            db.executescript(SCHEMA)
 
     def _connect(self) -> sqlite3.Connection:
         # Koneksi baru tiap operasi: aman dipakai dari beberapa sesi Streamlit (thread) sekaligus
@@ -115,3 +122,38 @@ class Cache:
                 "software = excluded.software, ai_version = excluded.ai_version, ai_at = excluded.ai_at",
                 records,
             )
+
+    def purge(self, force: bool = False) -> int | None:
+        """Hapus entri yang deskripsi dan hasil AI-nya sudah kedaluwarsa, paling sering sekali sehari.
+
+        Mengembalikan jumlah lowongan yang dihapus, atau None jika pembersihan dilewati karena belum waktunya.
+        """
+        now = self.clock()
+        with self._connect() as db:
+            row = db.execute("SELECT value FROM meta WHERE key = 'last_purge'").fetchone()
+            if not force and row and now - float(row[0]) < PURGE_INTERVAL:
+                return None
+            cutoff = now - self.ttl
+            deleted = db.execute(
+                "DELETE FROM jobs WHERE MAX(COALESCE(description_at, 0), COALESCE(ai_at, 0)) < ?", (cutoff,)
+            ).rowcount
+            db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('last_purge', ?)", (str(now),))
+        if deleted >= VACUUM_MIN_DELETED:
+            # VACUUM mengecilkan file; gagal jika sesi lain sedang menulis, dan itu tidak apa-apa
+            db = self._connect()
+            try:
+                db.execute("VACUUM")
+                # Dalam mode WAL hasil VACUUM masih di file -wal; pindahkan ke file utama dan kosongkan -wal
+                db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.OperationalError:
+                pass
+            finally:
+                db.close()
+        return deleted
+
+    def stats(self) -> dict:
+        with self._connect() as db:
+            count = db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+        wal = self.path.with_name(self.path.name + "-wal")
+        size = self.path.stat().st_size + (wal.stat().st_size if wal.exists() else 0)
+        return {"jobs": count, "bytes": size}

@@ -185,6 +185,20 @@ def run_search(
         "pull_finished", found=len(rows), with_description=sum(r["description"] is not None for r in rows),
         analyzed=sum(r["requirements"] is not None for r in rows), seconds=round(time.monotonic() - started),
     )
+    purge_cache()
+
+
+def purge_cache() -> None:
+    """Hapus entri cache yang sudah kedaluwarsa (paling sering sekali sehari); kegagalan tidak menghentikan aplikasi."""
+    if not cfg["cache"]["enabled"]:
+        return
+    try:
+        store = cache.Cache(scraper.CONFIG_PATH.parent / cfg["cache"]["path"], cfg["cache"]["ttl_days"])
+        deleted = store.purge()
+        if deleted is not None:
+            log_event("cache_purged", deleted=deleted, **store.stats())
+    except Exception as e:
+        log_event("cache_purge_failed", error=f"{type(e).__name__}: {e}")
 
 
 def _run_search(

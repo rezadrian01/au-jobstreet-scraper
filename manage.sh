@@ -109,6 +109,14 @@ cmd_status() {
     echo \"Versi kode    : \$(sudo -u $APP_USER git -C $APP_DIR log -1 --format='%h %s (%cd)' --date=format:'%d %b %H:%M')\"
     echo \"Disk          : \$(df -h / | awk 'NR==2 {print \$3 \" terpakai dari \" \$2}')\"
     echo \"Memori        : \$(free -m | awk 'NR==2 {print \$3 \" MB terpakai dari \" \$2 \" MB\"}')\"
+    echo \"Cache         : \$(sudo -u $APP_USER $VENV_DIR/bin/python -c \"
+import os, sqlite3
+f = '$APP_DIR/data/cache.sqlite'
+if not os.path.exists(f): print('belum ada')
+else:
+    size = sum(os.path.getsize(p) for p in (f, f + '-wal') if os.path.exists(p))
+    print(f'{size / 1e6:.1f} MB, {sqlite3.connect(f).execute(\\\"SELECT COUNT(*) FROM jobs\\\").fetchone()[0]} lowongan')
+\" 2>&1 | tail -1)\"
     last=\$(sudo journalctl -u $SERVICE --since '-7d' --no-pager -o cat | grep 'jobscraper.audit' | tail -1 | cut -c1-150)
     echo \"Audit terakhir: \${last:-(belum ada dalam 7 hari)}\"
   "
